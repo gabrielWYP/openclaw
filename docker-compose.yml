@@ -8,9 +8,12 @@ services:
       CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+      PATH : /home/node/.openclaw/bin:${PATH}
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - /home/linuxbrew/.linuxbrew/bin/gog:/home/node/.openclaw/bin/gog 
+      - /home/opc/.config/gogcli:/home/node/.config/gogcli
     ports:
       - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
       - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
