@@ -1,5 +1,7 @@
 import { html, nothing } from "lit";
+import { ref } from "lit/directives/ref.js";
 import { t } from "../../i18n/index.ts";
+import { SLASH_COMMANDS } from "../chat/slash-commands.ts";
 import { icons, type IconName } from "../icons.ts";
 
 type PaletteItem = {
@@ -11,55 +13,17 @@ type PaletteItem = {
   description?: string;
 };
 
+const SLASH_PALETTE_ITEMS: PaletteItem[] = SLASH_COMMANDS.map((command) => ({
+  id: `slash:${command.name}`,
+  label: `/${command.name}`,
+  icon: command.icon ?? "terminal",
+  category: "search",
+  action: `/${command.name}`,
+  description: command.description,
+}));
+
 const PALETTE_ITEMS: PaletteItem[] = [
-  {
-    id: "status",
-    label: "/status",
-    icon: "radio",
-    category: "search",
-    action: "/status",
-    description: "Show current status",
-  },
-  {
-    id: "models",
-    label: "/model",
-    icon: "monitor",
-    category: "search",
-    action: "/model",
-    description: "Show/set model",
-  },
-  {
-    id: "usage",
-    label: "/usage",
-    icon: "barChart",
-    category: "search",
-    action: "/usage",
-    description: "Show usage",
-  },
-  {
-    id: "think",
-    label: "/think",
-    icon: "brain",
-    category: "search",
-    action: "/think",
-    description: "Set thinking level",
-  },
-  {
-    id: "reset",
-    label: "/reset",
-    icon: "loader",
-    category: "search",
-    action: "/reset",
-    description: "Reset session",
-  },
-  {
-    id: "help",
-    label: "/help",
-    icon: "book",
-    category: "search",
-    action: "/help",
-    description: "Show help",
-  },
+  ...SLASH_PALETTE_ITEMS,
   {
     id: "nav-overview",
     label: "Overview",
@@ -114,6 +78,10 @@ const PALETTE_ITEMS: PaletteItem[] = [
   },
 ];
 
+export function getPaletteItems(): readonly PaletteItem[] {
+  return PALETTE_ITEMS;
+}
+
 export type CommandPaletteProps = {
   open: boolean;
   query: string;
@@ -147,6 +115,19 @@ function groupItems(items: PaletteItem[]): Array<[string, PaletteItem[]]> {
   return [...map.entries()];
 }
 
+let previouslyFocused: Element | null = null;
+
+function saveFocus() {
+  previouslyFocused = document.activeElement;
+}
+
+function restoreFocus() {
+  if (previouslyFocused && previouslyFocused instanceof HTMLElement) {
+    requestAnimationFrame(() => previouslyFocused && (previouslyFocused as HTMLElement).focus());
+  }
+  previouslyFocused = null;
+}
+
 function selectItem(item: PaletteItem, props: CommandPaletteProps) {
   if (item.action.startsWith("nav:")) {
     props.onNavigate(item.action.slice(4));
@@ -154,18 +135,31 @@ function selectItem(item: PaletteItem, props: CommandPaletteProps) {
     props.onSlashCommand(item.action);
   }
   props.onToggle();
+  restoreFocus();
+}
+
+function scrollActiveIntoView() {
+  requestAnimationFrame(() => {
+    const el = document.querySelector(".cmd-palette__item--active");
+    el?.scrollIntoView({ block: "nearest" });
+  });
 }
 
 function handleKeydown(e: KeyboardEvent, props: CommandPaletteProps) {
   const items = filteredItems(props.query);
+  if (items.length === 0 && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter")) {
+    return;
+  }
   switch (e.key) {
     case "ArrowDown":
       e.preventDefault();
-      props.onActiveIndexChange(Math.min(props.activeIndex + 1, items.length - 1));
+      props.onActiveIndexChange((props.activeIndex + 1) % items.length);
+      scrollActiveIntoView();
       break;
     case "ArrowUp":
       e.preventDefault();
-      props.onActiveIndexChange(Math.max(props.activeIndex - 1, 0));
+      props.onActiveIndexChange((props.activeIndex - 1 + items.length) % items.length);
+      scrollActiveIntoView();
       break;
     case "Enter":
       e.preventDefault();
@@ -176,6 +170,7 @@ function handleKeydown(e: KeyboardEvent, props: CommandPaletteProps) {
     case "Escape":
       e.preventDefault();
       props.onToggle();
+      restoreFocus();
       break;
   }
 }
@@ -186,6 +181,13 @@ const CATEGORY_LABELS: Record<string, string> = {
   skills: "Skills",
 };
 
+function focusInput(el: Element | undefined) {
+  if (el) {
+    saveFocus();
+    requestAnimationFrame(() => (el as HTMLInputElement).focus());
+  }
+}
+
 export function renderCommandPalette(props: CommandPaletteProps) {
   if (!props.open) {
     return nothing;
@@ -195,9 +197,17 @@ export function renderCommandPalette(props: CommandPaletteProps) {
   const grouped = groupItems(items);
 
   return html`
-    <div class="cmd-palette-overlay" @click=${() => props.onToggle()}>
-      <div class="cmd-palette" @click=${(e: Event) => e.stopPropagation()}>
+    <div class="cmd-palette-overlay" @click=${() => {
+      props.onToggle();
+      restoreFocus();
+    }}>
+      <div
+        class="cmd-palette"
+        @click=${(e: Event) => e.stopPropagation()}
+        @keydown=${(e: KeyboardEvent) => handleKeydown(e, props)}
+      >
         <input
+          ${ref(focusInput)}
           class="cmd-palette__input"
           placeholder="${t("overview.palette.placeholder")}"
           .value=${props.query}
@@ -205,13 +215,14 @@ export function renderCommandPalette(props: CommandPaletteProps) {
             props.onQueryChange((e.target as HTMLInputElement).value);
             props.onActiveIndexChange(0);
           }}
-          @keydown=${(e: KeyboardEvent) => handleKeydown(e, props)}
-          autofocus
         />
         <div class="cmd-palette__results">
           ${
             grouped.length === 0
-              ? html`<div class="muted" style="padding: 12px 16px">${t("overview.palette.noResults")}</div>`
+              ? html`<div class="cmd-palette__empty">
+                  <span class="nav-item__icon" style="opacity:0.3;width:20px;height:20px">${icons.search}</span>
+                  <span>${t("overview.palette.noResults")}</span>
+                </div>`
               : grouped.map(
                   ([category, groupedItems]) => html`
                 <div class="cmd-palette__group-label">${CATEGORY_LABELS[category] ?? category}</div>
@@ -221,7 +232,10 @@ export function renderCommandPalette(props: CommandPaletteProps) {
                   return html`
                     <div
                       class="cmd-palette__item ${isActive ? "cmd-palette__item--active" : ""}"
-                      @click=${() => selectItem(item, props)}
+                      @click=${(e: Event) => {
+                        e.stopPropagation();
+                        selectItem(item, props);
+                      }}
                       @mouseenter=${() => props.onActiveIndexChange(globalIndex)}
                     >
                       <span class="nav-item__icon">${icons[item.icon]}</span>
@@ -237,6 +251,11 @@ export function renderCommandPalette(props: CommandPaletteProps) {
               `,
                 )
           }
+        </div>
+        <div class="cmd-palette__footer">
+          <span><kbd>↑↓</kbd> navigate</span>
+          <span><kbd>↵</kbd> select</span>
+          <span><kbd>esc</kbd> close</span>
         </div>
       </div>
     </div>

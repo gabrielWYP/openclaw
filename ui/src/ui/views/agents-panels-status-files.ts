@@ -1,5 +1,8 @@
 import { html, nothing } from "lit";
+import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { formatRelativeTimestamp } from "../format.ts";
+import { icons } from "../icons.ts";
+import { toSanitizedMarkdownHtml } from "../markdown.ts";
 import {
   formatCronPayload,
   formatCronSchedule,
@@ -15,6 +18,7 @@ import type {
   CronStatus,
 } from "../types.ts";
 import { formatBytes, type AgentContext } from "./agents-utils.ts";
+import { resolveChannelExtras as resolveChannelExtrasFromConfig } from "./channel-config-extras.ts";
 
 function renderAgentContextCard(context: AgentContext, subtitle: string) {
   return html`
@@ -35,8 +39,8 @@ function renderAgentContextCard(context: AgentContext, subtitle: string) {
           <div>${context.identityName}</div>
         </div>
         <div class="agent-kv">
-          <div class="label">Identity Emoji</div>
-          <div>${context.identityEmoji}</div>
+          <div class="label">Identity Avatar</div>
+          <div>${context.identityAvatar}</div>
         </div>
         <div class="agent-kv">
           <div class="label">Skills Filter</div>
@@ -99,55 +103,6 @@ function resolveChannelEntries(snapshot: ChannelsStatusSnapshot | null): Channel
 }
 
 const CHANNEL_EXTRA_FIELDS = ["groupPolicy", "streamMode", "dmPolicy"] as const;
-
-function resolveChannelConfigValue(
-  configForm: Record<string, unknown> | null,
-  channelId: string,
-): Record<string, unknown> | null {
-  if (!configForm) {
-    return null;
-  }
-  const channels = (configForm.channels ?? {}) as Record<string, unknown>;
-  const fromChannels = channels[channelId];
-  if (fromChannels && typeof fromChannels === "object") {
-    return fromChannels as Record<string, unknown>;
-  }
-  const fallback = configForm[channelId];
-  if (fallback && typeof fallback === "object") {
-    return fallback as Record<string, unknown>;
-  }
-  return null;
-}
-
-function formatChannelExtraValue(raw: unknown): string {
-  if (raw == null) {
-    return "n/a";
-  }
-  if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") {
-    return String(raw);
-  }
-  try {
-    return JSON.stringify(raw);
-  } catch {
-    return "n/a";
-  }
-}
-
-function resolveChannelExtras(
-  configForm: Record<string, unknown> | null,
-  channelId: string,
-): Array<{ label: string; value: string }> {
-  const value = resolveChannelConfigValue(configForm, channelId);
-  if (!value) {
-    return [];
-  }
-  return CHANNEL_EXTRA_FIELDS.flatMap((field) => {
-    if (!(field in value)) {
-      return [];
-    }
-    return [{ label: field, value: formatChannelExtraValue(value[field]) }];
-  });
-}
 
 function summarizeChannelAccounts(accounts: ChannelAccountSnapshot[]) {
   let connected = 0;
@@ -234,7 +189,11 @@ export function renderAgentChannels(params: {
                       ? `${summary.configured} configured`
                       : "not configured";
                     const enabled = summary.total ? `${summary.enabled} enabled` : "disabled";
-                    const extras = resolveChannelExtras(params.configForm, entry.id);
+                    const extras = resolveChannelExtrasFromConfig({
+                      configForm: params.configForm,
+                      channelId: entry.id,
+                      fields: CHANNEL_EXTRA_FIELDS,
+                    });
                     return html`
                       <div class="list-item">
                         <div class="list-main">
@@ -457,6 +416,21 @@ export function renderAgentFiles(params: {
                             <div class="agent-file-actions">
                               <button
                                 class="btn btn--sm"
+                                title="Preview rendered markdown"
+                                @click=${(e: Event) => {
+                                  const btn = e.currentTarget as HTMLElement;
+                                  const dialog = btn
+                                    .closest(".agent-files-editor")
+                                    ?.querySelector("dialog");
+                                  if (dialog) {
+                                    dialog.showModal();
+                                  }
+                                }}
+                              >
+                                ${icons.eye} Preview
+                              </button>
+                              <button
+                                class="btn btn--sm"
                                 ?disabled=${!isDirty}
                                 @click=${() => params.onFileReset(activeEntry.name)}
                               >
@@ -480,9 +454,10 @@ export function renderAgentFiles(params: {
                                 `
                               : nothing
                           }
-                          <label class="field" style="margin-top: 12px;">
+                          <label class="field agent-file-field" style="margin-top: 12px;">
                             <span>Content</span>
                             <textarea
+                              class="agent-file-textarea"
                               .value=${draft}
                               @input=${(e: Event) =>
                                 params.onFileDraftChange(
@@ -491,6 +466,30 @@ export function renderAgentFiles(params: {
                                 )}
                             ></textarea>
                           </label>
+                          <dialog
+                            class="md-preview-dialog"
+                            @click=${(e: Event) => {
+                              const dialog = e.currentTarget as HTMLDialogElement;
+                              if (e.target === dialog) {
+                                dialog.close();
+                              }
+                            }}
+                          >
+                            <div class="md-preview-dialog__panel">
+                              <div class="md-preview-dialog__header">
+                                <div class="md-preview-dialog__title mono">${activeEntry.name}</div>
+                                <button
+                                  class="btn btn--sm"
+                                  @click=${(e: Event) => {
+                                    (e.currentTarget as HTMLElement).closest("dialog")?.close();
+                                  }}
+                                >${icons.x} Close</button>
+                              </div>
+                              <div class="md-preview-dialog__body sidebar-markdown">
+                                ${unsafeHTML(toSanitizedMarkdownHtml(draft))}
+                              </div>
+                            </div>
+                          </dialog>
                         `
                   }
                 </div>

@@ -42,6 +42,7 @@ import {
   loadOverview as loadOverviewInternal,
   setTab as setTabInternal,
   setTheme as setThemeInternal,
+  setThemeMode as setThemeModeInternal,
   onPopState as onPopStateInternal,
 } from "./app-settings.ts";
 import {
@@ -52,6 +53,7 @@ import {
 } from "./app-tool-stream.ts";
 import type { AppViewState } from "./app-view-state.ts";
 import { normalizeAssistantIdentity } from "./assistant-identity.ts";
+import { exportChatMarkdown } from "./chat/export.ts";
 import { loadAssistantIdentity as loadAssistantIdentityInternal } from "./controllers/assistant-identity.ts";
 import type { DevicePairingList } from "./controllers/devices.ts";
 import type { ExecApprovalRequest } from "./controllers/exec-approval.ts";
@@ -60,13 +62,14 @@ import type { SkillMessage } from "./controllers/skills.ts";
 import type { GatewayBrowserClient, GatewayHelloOk } from "./gateway.ts";
 import type { Tab } from "./navigation.ts";
 import { loadSettings, type UiSettings } from "./storage.ts";
-import { VALID_THEMES, type ResolvedTheme, type ThemeMode } from "./theme.ts";
+import { VALID_THEME_NAMES, type ResolvedTheme, type ThemeMode, type ThemeName } from "./theme.ts";
 import type {
   AgentsListResult,
   AgentsFilesListResult,
   AgentIdentityResult,
   ConfigSnapshot,
   ConfigUiHints,
+  ChatModelOverride,
   CronJob,
   CronRunLogEntry,
   CronStatus,
@@ -80,8 +83,10 @@ import type {
   SkillStatusReport,
   StatusSummary,
   NostrProfile,
+  ToolsCatalogResult,
 } from "./types.ts";
 import { type ChatAttachment, type ChatQueueItem, type CronFormState } from "./ui-types.ts";
+import { generateUUID } from "./uuid.ts";
 import type { NostrProfileFormState } from "./views/channels.nostr-profile-form.ts";
 
 declare global {
@@ -108,6 +113,8 @@ function resolveOnboardingMode(): boolean {
 @customElement("openclaw-app")
 export class OpenClawApp extends LitElement {
   private i18nController = new I18nController(this);
+  clientInstanceId = generateUUID();
+  connectGeneration = 0;
   @state() settings: UiSettings = loadSettings();
   constructor() {
     super();
@@ -116,14 +123,18 @@ export class OpenClawApp extends LitElement {
     }
   }
   @state() password = "";
+  @state() loginShowGatewayToken = false;
+  @state() loginShowGatewayPassword = false;
   @state() tab: Tab = "chat";
   @state() onboarding = resolveOnboardingMode();
   @state() connected = false;
-  @state() theme: ThemeMode = this.settings.theme ?? "dark";
+  @state() theme: ThemeName = this.settings.theme ?? "claw";
+  @state() themeMode: ThemeMode = this.settings.themeMode ?? "system";
   @state() themeResolved: ResolvedTheme = "dark";
-  @state() themeOrder: ThemeMode[] = this.buildThemeOrder(this.theme);
+  @state() themeOrder: ThemeName[] = this.buildThemeOrder(this.theme);
   @state() hello: GatewayHelloOk | null = null;
   @state() lastError: string | null = null;
+  @state() lastErrorCode: string | null = null;
   @state() eventLog: EventLogEntry[] = [];
   private eventLogBuffer: EventLogEntry[] = [];
   private toolStreamSyncTimer: number | null = null;
@@ -132,6 +143,7 @@ export class OpenClawApp extends LitElement {
   @state() assistantName = bootAssistantIdentity.name;
   @state() assistantAvatar = bootAssistantIdentity.avatar;
   @state() assistantAgentId = bootAssistantIdentity.agentId ?? null;
+  @state() serverVersion: string | null = null;
 
   @state() sessionKey = this.settings.sessionKey;
   @state() chatLoading = false;
@@ -139,6 +151,7 @@ export class OpenClawApp extends LitElement {
   @state() chatMessage = "";
   @state() chatMessages: unknown[] = [];
   @state() chatToolMessages: unknown[] = [];
+  @state() chatStreamSegments: Array<{ text: string; ts: number }> = [];
   @state() chatStream: string | null = null;
   @state() chatStreamStartedAt: number | null = null;
   @state() chatRunId: string | null = null;
@@ -146,9 +159,16 @@ export class OpenClawApp extends LitElement {
   @state() fallbackStatus: FallbackStatus | null = null;
   @state() chatAvatarUrl: string | null = null;
   @state() chatThinkingLevel: string | null = null;
+  @state() chatModelOverrides: Record<string, ChatModelOverride | null> = {};
+  @state() chatModelsLoading = false;
+  @state() chatModelCatalog: ModelCatalogEntry[] = [];
   @state() chatQueue: ChatQueueItem[] = [];
   @state() chatAttachments: ChatAttachment[] = [];
   @state() chatManualRefreshInFlight = false;
+  @state() navDrawerOpen = false;
+
+  onSlashAction?: (action: string) => void;
+
   // Sidebar state for tool output viewing
   @state() sidebarOpen = false;
   @state() sidebarContent: string | null = null;
@@ -172,6 +192,7 @@ export class OpenClawApp extends LitElement {
   @state() execApprovalBusy = false;
   @state() execApprovalError: string | null = null;
   @state() pendingGatewayUrl: string | null = null;
+  pendingGatewayToken: string | null = null;
 
   @state() configLoading = false;
   @state() configRaw = "{\n}\n";
@@ -194,6 +215,26 @@ export class OpenClawApp extends LitElement {
   @state() configSearchQuery = "";
   @state() configActiveSection: string | null = null;
   @state() configActiveSubsection: string | null = null;
+  @state() communicationsFormMode: "form" | "raw" = "form";
+  @state() communicationsSearchQuery = "";
+  @state() communicationsActiveSection: string | null = null;
+  @state() communicationsActiveSubsection: string | null = null;
+  @state() appearanceFormMode: "form" | "raw" = "form";
+  @state() appearanceSearchQuery = "";
+  @state() appearanceActiveSection: string | null = null;
+  @state() appearanceActiveSubsection: string | null = null;
+  @state() automationFormMode: "form" | "raw" = "form";
+  @state() automationSearchQuery = "";
+  @state() automationActiveSection: string | null = null;
+  @state() automationActiveSubsection: string | null = null;
+  @state() infrastructureFormMode: "form" | "raw" = "form";
+  @state() infrastructureSearchQuery = "";
+  @state() infrastructureActiveSection: string | null = null;
+  @state() infrastructureActiveSubsection: string | null = null;
+  @state() aiAgentsFormMode: "form" | "raw" = "form";
+  @state() aiAgentsSearchQuery = "";
+  @state() aiAgentsActiveSection: string | null = null;
+  @state() aiAgentsActiveSubsection: string | null = null;
 
   @state() channelsLoading = false;
   @state() channelsSnapshot: ChannelsStatusSnapshot | null = null;
@@ -215,6 +256,9 @@ export class OpenClawApp extends LitElement {
   @state() agentsList: AgentsListResult | null = null;
   @state() agentsError: string | null = null;
   @state() agentsSelectedId: string | null = null;
+  @state() toolsCatalogLoading = false;
+  @state() toolsCatalogError: string | null = null;
+  @state() toolsCatalogResult: ToolsCatalogResult | null = null;
   @state() agentsPanel: "overview" | "files" | "tools" | "skills" | "channels" | "cron" =
     "overview";
   @state() agentFilesLoading = false;
@@ -231,7 +275,6 @@ export class OpenClawApp extends LitElement {
   @state() agentSkillsError: string | null = null;
   @state() agentSkillsReport: SkillStatusReport | null = null;
   @state() agentSkillsAgentId: string | null = null;
-  @state() agentsSidebarFilter = "";
 
   @state() sessionsLoading = false;
   @state() sessionsResult: SessionsListResult | null = null;
@@ -240,6 +283,13 @@ export class OpenClawApp extends LitElement {
   @state() sessionsFilterLimit = "120";
   @state() sessionsIncludeGlobal = true;
   @state() sessionsIncludeUnknown = false;
+  @state() sessionsHideCron = true;
+  @state() sessionsSearchQuery = "";
+  @state() sessionsSortColumn: "key" | "kind" | "updated" | "tokens" = "updated";
+  @state() sessionsSortDir: "asc" | "desc" = "desc";
+  @state() sessionsPage = 0;
+  @state() sessionsPageSize = 25;
+  @state() sessionsSelectedKeys: Set<string> = new Set();
 
   @state() usageLoading = false;
   @state() usageResult: import("./types.js").SessionsUsageResult | null = null;
@@ -297,12 +347,39 @@ export class OpenClawApp extends LitElement {
   usageQueryDebounceTimer: number | null = null;
 
   @state() cronLoading = false;
+  @state() cronJobsLoadingMore = false;
   @state() cronJobs: CronJob[] = [];
+  @state() cronJobsTotal = 0;
+  @state() cronJobsHasMore = false;
+  @state() cronJobsNextOffset: number | null = null;
+  @state() cronJobsLimit = 50;
+  @state() cronJobsQuery = "";
+  @state() cronJobsEnabledFilter: import("./types.js").CronJobsEnabledFilter = "all";
+  @state() cronJobsScheduleKindFilter: import("./controllers/cron.js").CronJobsScheduleKindFilter =
+    "all";
+  @state() cronJobsLastStatusFilter: import("./controllers/cron.js").CronJobsLastStatusFilter =
+    "all";
+  @state() cronJobsSortBy: import("./types.js").CronJobsSortBy = "nextRunAtMs";
+  @state() cronJobsSortDir: import("./types.js").CronSortDir = "asc";
   @state() cronStatus: CronStatus | null = null;
   @state() cronError: string | null = null;
   @state() cronForm: CronFormState = { ...DEFAULT_CRON_FORM };
+  @state() cronFieldErrors: import("./controllers/cron.js").CronFieldErrors = {};
+  @state() cronEditingJobId: string | null = null;
   @state() cronRunsJobId: string | null = null;
+  @state() cronRunsLoadingMore = false;
   @state() cronRuns: CronRunLogEntry[] = [];
+  @state() cronRunsTotal = 0;
+  @state() cronRunsHasMore = false;
+  @state() cronRunsNextOffset: number | null = null;
+  @state() cronRunsLimit = 50;
+  @state() cronRunsScope: import("./types.js").CronRunScope = "all";
+  @state() cronRunsStatuses: import("./types.js").CronRunsStatusValue[] = [];
+  @state() cronRunsDeliveryStatuses: import("./types.js").CronDeliveryStatus[] = [];
+  @state() cronRunsStatusFilter: import("./types.js").CronRunsStatusFilter = "all";
+  @state() cronRunsQuery = "";
+  @state() cronRunsSortDir: import("./types.js").CronSortDir = "desc";
+  @state() cronModelSuggestions: string[] = [];
   @state() cronBusy = false;
 
   @state() updateAvailable: import("./types.js").UpdateAvailable | null = null;
@@ -310,17 +387,10 @@ export class OpenClawApp extends LitElement {
   // Overview dashboard state
   @state() attentionItems: import("./types.js").AttentionItem[] = [];
   @state() paletteOpen = false;
-  paletteQuery = "";
-  paletteActiveIndex = 0;
-  @state() streamMode = (() => {
-    try {
-      const stored = localStorage.getItem("openclaw:stream-mode");
-      // Default to true (redacted) unless explicitly disabled
-      return stored === null ? true : stored === "true";
-    } catch {
-      return true;
-    }
-  })();
+  @state() paletteQuery = "";
+  @state() paletteActiveIndex = 0;
+  @state() overviewShowGatewayToken = false;
+  @state() overviewShowGatewayPassword = false;
   @state() overviewLogLines: string[] = [];
   @state() overviewLogCursor = 0;
 
@@ -379,6 +449,16 @@ export class OpenClawApp extends LitElement {
   private popStateHandler = () =>
     onPopStateInternal(this as unknown as Parameters<typeof onPopStateInternal>[0]);
   private topbarObserver: ResizeObserver | null = null;
+  private globalKeydownHandler = (e: KeyboardEvent) => {
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === "k") {
+      e.preventDefault();
+      this.paletteOpen = !this.paletteOpen;
+      if (this.paletteOpen) {
+        this.paletteQuery = "";
+        this.paletteActiveIndex = 0;
+      }
+    }
+  };
 
   createRenderRoot() {
     return this;
@@ -386,6 +466,20 @@ export class OpenClawApp extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    this.onSlashAction = (action: string) => {
+      switch (action) {
+        case "toggle-focus":
+          this.applySettings({
+            ...this.settings,
+            chatFocusMode: !this.settings.chatFocusMode,
+          });
+          break;
+        case "export":
+          exportChatMarkdown(this.chatMessages, this.assistantName);
+          break;
+      }
+    };
+    document.addEventListener("keydown", this.globalKeydownHandler);
     handleConnected(this as unknown as Parameters<typeof handleConnected>[0]);
   }
 
@@ -394,6 +488,7 @@ export class OpenClawApp extends LitElement {
   }
 
   disconnectedCallback() {
+    document.removeEventListener("keydown", this.globalKeydownHandler);
     handleDisconnected(this as unknown as Parameters<typeof handleDisconnected>[0]);
     super.disconnectedCallback();
   }
@@ -451,23 +546,34 @@ export class OpenClawApp extends LitElement {
 
   setTab(next: Tab) {
     setTabInternal(this as unknown as Parameters<typeof setTabInternal>[0], next);
+    this.navDrawerOpen = false;
   }
 
-  setTheme(next: ThemeMode, context?: Parameters<typeof setThemeInternal>[2]) {
+  setTheme(next: ThemeName, context?: Parameters<typeof setThemeInternal>[2]) {
     setThemeInternal(this as unknown as Parameters<typeof setThemeInternal>[0], next, context);
     this.themeOrder = this.buildThemeOrder(next);
   }
 
-  buildThemeOrder(active: ThemeMode): ThemeMode[] {
-    const all = [...VALID_THEMES];
-    const rest = all.filter((id) => id !== active);
-    return [active, ...rest];
+  setThemeMode(next: ThemeMode, context?: Parameters<typeof setThemeModeInternal>[2]) {
+    setThemeModeInternal(
+      this as unknown as Parameters<typeof setThemeModeInternal>[0],
+      next,
+      context,
+    );
   }
 
-  handleThemeToggleCollapse() {
-    setTimeout(() => {
-      this.themeOrder = this.buildThemeOrder(this.theme);
-    }, 80);
+  setBorderRadius(value: number) {
+    applySettingsInternal(this as unknown as Parameters<typeof applySettingsInternal>[0], {
+      ...this.settings,
+      borderRadius: value,
+    });
+    this.requestUpdate();
+  }
+
+  buildThemeOrder(active: ThemeName): ThemeName[] {
+    const all = [...VALID_THEME_NAMES];
+    const rest = all.filter((id) => id !== active);
+    return [active, ...rest];
   }
 
   async loadOverview() {
@@ -569,16 +675,20 @@ export class OpenClawApp extends LitElement {
     if (!nextGatewayUrl) {
       return;
     }
+    const nextToken = this.pendingGatewayToken?.trim() || "";
     this.pendingGatewayUrl = null;
+    this.pendingGatewayToken = null;
     applySettingsInternal(this as unknown as Parameters<typeof applySettingsInternal>[0], {
       ...this.settings,
       gatewayUrl: nextGatewayUrl,
+      token: nextToken,
     });
     this.connect();
   }
 
   handleGatewayUrlCancel() {
     this.pendingGatewayUrl = null;
+    this.pendingGatewayToken = null;
   }
 
   // Sidebar handlers for tool output viewing

@@ -2,7 +2,6 @@ import { html, nothing, type TemplateResult } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { t } from "../../i18n/index.ts";
 import { formatCost, formatTokens, formatRelativeTimestamp } from "../format.ts";
-import { icons } from "../icons.ts";
 import { formatNextRun } from "../presenter.ts";
 import type {
   SessionsUsageResult,
@@ -19,13 +18,8 @@ export type OverviewCardsProps = {
   cronJobs: CronJob[];
   cronStatus: CronStatus | null;
   presenceCount: number;
-  redacted: boolean;
   onNavigate: (tab: string) => void;
 };
-
-function redact(value: string, redacted: boolean) {
-  return redacted ? "••••••" : value;
-}
 
 const DIGIT_RUN = /\d{3,}/g;
 
@@ -35,7 +29,47 @@ function blurDigits(value: string): TemplateResult {
   return html`${unsafeHTML(blurred)}`;
 }
 
+type StatCard = {
+  kind: string;
+  tab: string;
+  label: string;
+  value: string | TemplateResult;
+  hint: string | TemplateResult;
+};
+
+function renderStatCard(card: StatCard, onNavigate: (tab: string) => void) {
+  return html`
+    <button class="ov-card" data-kind=${card.kind} @click=${() => onNavigate(card.tab)}>
+      <span class="ov-card__label">${card.label}</span>
+      <span class="ov-card__value">${card.value}</span>
+      <span class="ov-card__hint">${card.hint}</span>
+    </button>
+  `;
+}
+
+function renderSkeletonCards() {
+  return html`
+    <section class="ov-cards">
+      ${[0, 1, 2, 3].map(
+        (i) => html`
+          <div class="ov-card" style="cursor:default;animation-delay:${i * 50}ms">
+            <span class="skeleton skeleton-line" style="width:60px;height:10px"></span>
+            <span class="skeleton skeleton-stat"></span>
+            <span class="skeleton skeleton-line skeleton-line--medium" style="height:12px"></span>
+          </div>
+        `,
+      )}
+    </section>
+  `;
+}
+
 export function renderOverviewCards(props: OverviewCardsProps) {
+  const dataLoaded =
+    props.usageResult != null || props.sessionsResult != null || props.skillsReport != null;
+  if (!dataLoaded) {
+    return renderSkeletonCards();
+  }
+
   const totals = props.usageResult?.totals;
   const totalCost = formatCost(totals?.totalCost);
   const totalTokens = formatTokens(totals?.totalTokens);
@@ -52,75 +86,74 @@ export function renderOverviewCards(props: OverviewCardsProps) {
   const cronJobCount = props.cronJobs.length;
   const failedCronCount = props.cronJobs.filter((j) => j.state?.lastStatus === "error").length;
 
+  const cronValue =
+    cronEnabled == null
+      ? t("common.na")
+      : cronEnabled
+        ? `${cronJobCount} jobs`
+        : t("common.disabled");
+
+  const cronHint =
+    failedCronCount > 0
+      ? html`<span class="danger">${failedCronCount} failed</span>`
+      : cronNext
+        ? t("overview.stats.cronNext", { time: formatNextRun(cronNext) })
+        : "";
+
+  const cards: StatCard[] = [
+    {
+      kind: "cost",
+      tab: "usage",
+      label: t("overview.cards.cost"),
+      value: totalCost,
+      hint: `${totalTokens} tokens · ${totalMessages} msgs`,
+    },
+    {
+      kind: "sessions",
+      tab: "sessions",
+      label: t("overview.stats.sessions"),
+      value: String(sessionCount ?? t("common.na")),
+      hint: t("overview.stats.sessionsHint"),
+    },
+    {
+      kind: "skills",
+      tab: "skills",
+      label: t("overview.cards.skills"),
+      value: `${enabledSkills}/${totalSkills}`,
+      hint: blockedSkills > 0 ? `${blockedSkills} blocked` : `${enabledSkills} active`,
+    },
+    {
+      kind: "cron",
+      tab: "cron",
+      label: t("overview.stats.cron"),
+      value: cronValue,
+      hint: cronHint,
+    },
+  ];
+
+  const sessions = props.sessionsResult?.sessions.slice(0, 5) ?? [];
+
   return html`
     <section class="ov-cards">
-      <div class="card ov-stat-card clickable" data-kind="cost" @click=${() => props.onNavigate("usage")}>
-        <div class="ov-stat-card__inner">
-          <div class="ov-stat-card__icon">${icons.barChart}</div>
-          <div class="ov-stat-card__body">
-            <div class="stat-label">${t("overview.cards.cost")}</div>
-            <div class="stat-value ${props.redacted ? "redacted" : ""}">${redact(totalCost, props.redacted)}</div>
-            <div class="muted">${redact(`${totalTokens} tokens · ${totalMessages} msgs`, props.redacted)}</div>
-          </div>
-        </div>
-      </div>
-      <div class="card ov-stat-card clickable" data-kind="sessions" @click=${() => props.onNavigate("sessions")}>
-        <div class="ov-stat-card__inner">
-          <div class="ov-stat-card__icon">${icons.fileText}</div>
-          <div class="ov-stat-card__body">
-            <div class="stat-label">${t("overview.stats.sessions")}</div>
-            <div class="stat-value">${sessionCount ?? t("common.na")}</div>
-            <div class="muted">${t("overview.stats.sessionsHint")}</div>
-          </div>
-        </div>
-      </div>
-      <div class="card ov-stat-card clickable" data-kind="skills" @click=${() => props.onNavigate("skills")}>
-        <div class="ov-stat-card__inner">
-          <div class="ov-stat-card__icon">${icons.zap}</div>
-          <div class="ov-stat-card__body">
-            <div class="stat-label">${t("overview.cards.skills")}</div>
-            <div class="stat-value">${enabledSkills}/${totalSkills}</div>
-            <div class="muted">${blockedSkills > 0 ? `${blockedSkills} blocked` : `${enabledSkills} active`}</div>
-          </div>
-        </div>
-      </div>
-      <div class="card ov-stat-card clickable" data-kind="cron" @click=${() => props.onNavigate("cron")}>
-        <div class="ov-stat-card__inner">
-          <div class="ov-stat-card__icon">${icons.scrollText}</div>
-          <div class="ov-stat-card__body">
-            <div class="stat-label">${t("overview.stats.cron")}</div>
-            <div class="stat-value">
-              ${cronEnabled == null ? t("common.na") : cronEnabled ? `${cronJobCount} jobs` : t("common.disabled")}
-            </div>
-            <div class="muted">
-              ${
-                failedCronCount > 0
-                  ? html`<span class="danger">${failedCronCount} failed</span>`
-                  : nothing
-              }
-              ${cronNext ? t("overview.stats.cronNext", { time: formatNextRun(cronNext) }) : ""}
-            </div>
-          </div>
-        </div>
-      </div>
+      ${cards.map((c) => renderStatCard(c, props.onNavigate))}
     </section>
 
     ${
-      props.sessionsResult && props.sessionsResult.sessions.length > 0
+      sessions.length > 0
         ? html`
-        <section class="card ov-recent-sessions">
-          <div class="card-title">${t("overview.cards.recentSessions")}</div>
-          <div class="ov-session-list">
-            ${props.sessionsResult.sessions.slice(0, 5).map(
+        <section class="ov-recent">
+          <h3 class="ov-recent__title">${t("overview.cards.recentSessions")}</h3>
+          <ul class="ov-recent__list">
+            ${sessions.map(
               (s) => html`
-                <div class="ov-session-row ${props.redacted ? "redacted" : ""}">
-                  <span class="ov-session-key">${props.redacted ? redact(s.displayName || s.label || s.key, true) : blurDigits(s.displayName || s.label || s.key)}</span>
-                  <span class="muted">${s.model ?? ""}</span>
-                  <span class="muted">${s.updatedAt ? formatRelativeTimestamp(s.updatedAt) : ""}</span>
-                </div>
+                <li class="ov-recent__row">
+                  <span class="ov-recent__key">${blurDigits(s.displayName || s.label || s.key)}</span>
+                  <span class="ov-recent__model">${s.model ?? ""}</span>
+                  <span class="ov-recent__time">${s.updatedAt ? formatRelativeTimestamp(s.updatedAt) : ""}</span>
+                </li>
               `,
             )}
-          </div>
+          </ul>
         </section>
       `
         : nothing

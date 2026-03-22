@@ -213,20 +213,17 @@ describe("isCommandMessage", () => {
 });
 
 describe("sanitizeRenderableText", () => {
-  it("breaks very long unbroken tokens to avoid overflow", () => {
-    const input = "a".repeat(140);
+  function expectTokenWidthUnderLimit(input: string) {
     const sanitized = sanitizeRenderableText(input);
     const longestSegment = Math.max(...sanitized.split(/\s+/).map((segment) => segment.length));
-
     expect(longestSegment).toBeLessThanOrEqual(32);
-  });
+  }
 
-  it("breaks moderately long unbroken tokens to protect narrow terminals", () => {
-    const input = "b".repeat(90);
-    const sanitized = sanitizeRenderableText(input);
-    const longestSegment = Math.max(...sanitized.split(/\s+/).map((segment) => segment.length));
-
-    expect(longestSegment).toBeLessThanOrEqual(32);
+  it.each([
+    { label: "very long", input: "a".repeat(140) },
+    { label: "moderately long", input: "b".repeat(90) },
+  ])("breaks $label unbroken tokens to protect narrow terminals", ({ input }) => {
+    expectTokenWidthUnderLimit(input);
   });
 
   it("preserves long filesystem paths verbatim for copy safety", () => {
@@ -247,6 +244,20 @@ describe("sanitizeRenderableText", () => {
 
   it("preserves long file-like underscore tokens for copy safety", () => {
     const input = "administrators_authorized_keys_with_extra_suffix".repeat(2);
+    const sanitized = sanitizeRenderableText(input);
+
+    expect(sanitized).toBe(input);
+  });
+
+  it("preserves long credential-like mixed alnum tokens for copy safety", () => {
+    const input = "e3b19c3b87bcf364b23eebb2c276e96ec478956ba1d84c93"; // pragma: allowlist secret
+    const sanitized = sanitizeRenderableText(input);
+
+    expect(sanitized).toBe(input);
+  });
+
+  it("preserves quoted credential-like mixed alnum tokens for copy safety", () => {
+    const input = "'e3b19c3b87bcf364b23eebb2c276e96ec478956ba1d84c93'"; // pragma: allowlist secret
     const sanitized = sanitizeRenderableText(input);
 
     expect(sanitized).toBe(input);

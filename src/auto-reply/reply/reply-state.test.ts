@@ -15,7 +15,9 @@ import {
   recordPendingHistoryEntryIfEnabled,
 } from "./history.js";
 import {
+  DEFAULT_MEMORY_FLUSH_FORCE_TRANSCRIPT_BYTES,
   DEFAULT_MEMORY_FLUSH_SOFT_TOKENS,
+  hasAlreadyFlushedForCurrentCompaction,
   resolveMemoryFlushContextWindowTokens,
   resolveMemoryFlushSettings,
   shouldRunMemoryFlush,
@@ -53,6 +55,15 @@ async function createCompactionSessionFixture(entry: SessionEntry) {
 }
 
 describe("history helpers", () => {
+  function createHistoryMapWithTwoEntries() {
+    const historyMap = new Map<string, { sender: string; body: string }[]>();
+    historyMap.set("group", [
+      { sender: "A", body: "one" },
+      { sender: "B", body: "two" },
+    ]);
+    return historyMap;
+  }
+
   it("returns current message when history is empty", () => {
     const result = buildHistoryContext({
       historyText: "  ",
@@ -104,11 +115,7 @@ describe("history helpers", () => {
   });
 
   it("builds context from map and appends entry", () => {
-    const historyMap = new Map<string, { sender: string; body: string }[]>();
-    historyMap.set("group", [
-      { sender: "A", body: "one" },
-      { sender: "B", body: "two" },
-    ]);
+    const historyMap = createHistoryMapWithTwoEntries();
 
     const result = buildHistoryContextFromMap({
       historyMap,
@@ -127,11 +134,7 @@ describe("history helpers", () => {
   });
 
   it("builds context from pending map without appending", () => {
-    const historyMap = new Map<string, { sender: string; body: string }[]>();
-    historyMap.set("group", [
-      { sender: "A", body: "one" },
-      { sender: "B", body: "two" },
-    ]);
+    const historyMap = createHistoryMapWithTwoEntries();
 
     const result = buildPendingHistoryContextFromMap({
       historyMap,
@@ -197,8 +200,13 @@ describe("memory flush settings", () => {
     const settings = resolveMemoryFlushSettings();
     expect(settings).not.toBeNull();
     expect(settings?.enabled).toBe(true);
+    expect(settings?.forceFlushTranscriptBytes).toBe(DEFAULT_MEMORY_FLUSH_FORCE_TRANSCRIPT_BYTES);
     expect(settings?.prompt.length).toBeGreaterThan(0);
     expect(settings?.systemPrompt.length).toBeGreaterThan(0);
+    expect(settings?.prompt).toContain("memory/YYYY-MM-DD.md");
+    expect(settings?.prompt).toContain("MEMORY.md");
+    expect(settings?.systemPrompt).toContain("memory/YYYY-MM-DD.md");
+    expect(settings?.systemPrompt).toContain("MEMORY.md");
   });
 
   it("respects disable flag", () => {
@@ -226,6 +234,10 @@ describe("memory flush settings", () => {
     });
     expect(settings?.prompt).toContain("NO_REPLY");
     expect(settings?.systemPrompt).toContain("NO_REPLY");
+    expect(settings?.prompt).toContain("memory/YYYY-MM-DD.md");
+    expect(settings?.prompt).toContain("MEMORY.md");
+    expect(settings?.systemPrompt).toContain("memory/YYYY-MM-DD.md");
+    expect(settings?.systemPrompt).toContain("MEMORY.md");
   });
 
   it("falls back to defaults when numeric values are invalid", () => {
@@ -243,7 +255,24 @@ describe("memory flush settings", () => {
     });
 
     expect(settings?.softThresholdTokens).toBe(DEFAULT_MEMORY_FLUSH_SOFT_TOKENS);
+    expect(settings?.forceFlushTranscriptBytes).toBe(DEFAULT_MEMORY_FLUSH_FORCE_TRANSCRIPT_BYTES);
     expect(settings?.reserveTokensFloor).toBe(DEFAULT_PI_COMPACTION_RESERVE_TOKENS_FLOOR);
+  });
+
+  it("parses forceFlushTranscriptBytes from byte-size strings", () => {
+    const settings = resolveMemoryFlushSettings({
+      agents: {
+        defaults: {
+          compaction: {
+            memoryFlush: {
+              forceFlushTranscriptBytes: "3mb",
+            },
+          },
+        },
+      },
+    });
+
+    expect(settings?.forceFlushTranscriptBytes).toBe(3 * 1024 * 1024);
   });
 });
 
@@ -330,6 +359,42 @@ describe("shouldRunMemoryFlush", () => {
   });
 });
 
+describe("hasAlreadyFlushedForCurrentCompaction", () => {
+  it("returns true when memoryFlushCompactionCount matches compactionCount", () => {
+    expect(
+      hasAlreadyFlushedForCurrentCompaction({
+        compactionCount: 3,
+        memoryFlushCompactionCount: 3,
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false when memoryFlushCompactionCount differs", () => {
+    expect(
+      hasAlreadyFlushedForCurrentCompaction({
+        compactionCount: 3,
+        memoryFlushCompactionCount: 2,
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when memoryFlushCompactionCount is undefined", () => {
+    expect(
+      hasAlreadyFlushedForCurrentCompaction({
+        compactionCount: 1,
+      }),
+    ).toBe(false);
+  });
+
+  it("treats missing compactionCount as 0", () => {
+    expect(
+      hasAlreadyFlushedForCurrentCompaction({
+        memoryFlushCompactionCount: 0,
+      }),
+    ).toBe(true);
+  });
+});
+
 describe("resolveMemoryFlushContextWindowTokens", () => {
   it("falls back to agent config or default tokens", () => {
     expect(resolveMemoryFlushContextWindowTokens({ agentCfgContextTokens: 42_000 })).toBe(42_000);
@@ -378,6 +443,23 @@ describe("incrementCompactionCount", () => {
     // input/output cleared since we only have the total estimate
     expect(stored[sessionKey].inputTokens).toBeUndefined();
     expect(stored[sessionKey].outputTokens).toBeUndefined();
+  });
+
+  it("increments compaction count by an explicit amount", async () => {
+    const entry = { sessionId: "s1", updatedAt: Date.now(), compactionCount: 2 } as SessionEntry;
+    const { storePath, sessionKey, sessionStore } = await createCompactionSessionFixture(entry);
+
+    const count = await incrementCompactionCount({
+      sessionEntry: entry,
+      sessionStore,
+      sessionKey,
+      storePath,
+      amount: 2,
+    });
+    expect(count).toBe(4);
+
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].compactionCount).toBe(4);
   });
 
   it("does not update totalTokens when tokensAfter is not provided", async () => {

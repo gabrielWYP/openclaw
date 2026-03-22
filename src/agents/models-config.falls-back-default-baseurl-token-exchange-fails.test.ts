@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { DEFAULT_COPILOT_API_BASE_URL } from "../providers/github-copilot-token.js";
+import { DEFAULT_COPILOT_API_BASE_URL } from "../../extensions/github-copilot/token.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import {
   installModelsConfigTestHooks,
@@ -12,6 +12,14 @@ import {
 import { ensureOpenClawModelsJson } from "./models-config.js";
 
 installModelsConfigTestHooks({ restoreFetch: true });
+
+async function readCopilotBaseUrl(agentDir: string) {
+  const raw = await fs.readFile(path.join(agentDir, "models.json"), "utf8");
+  const parsed = JSON.parse(raw) as {
+    providers: Record<string, { baseUrl?: string }>;
+  };
+  return parsed.providers["github-copilot"]?.baseUrl;
+}
 
 describe("models-config", () => {
   it("falls back to default baseUrl when token exchange fails", async () => {
@@ -24,15 +32,8 @@ describe("models-config", () => {
         });
         globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-        await ensureOpenClawModelsJson({ models: { providers: {} } });
-
-        const agentDir = path.join(process.env.HOME ?? "", ".openclaw", "agents", "main", "agent");
-        const raw = await fs.readFile(path.join(agentDir, "models.json"), "utf8");
-        const parsed = JSON.parse(raw) as {
-          providers: Record<string, { baseUrl?: string }>;
-        };
-
-        expect(parsed.providers["github-copilot"]?.baseUrl).toBe(DEFAULT_COPILOT_API_BASE_URL);
+        const { agentDir } = await ensureOpenClawModelsJson({ models: { providers: {} } });
+        expect(await readCopilotBaseUrl(agentDir)).toBe(DEFAULT_COPILOT_API_BASE_URL);
       });
     });
   });
@@ -63,12 +64,7 @@ describe("models-config", () => {
 
         await ensureOpenClawModelsJson({ models: { providers: {} } }, agentDir);
 
-        const raw = await fs.readFile(path.join(agentDir, "models.json"), "utf8");
-        const parsed = JSON.parse(raw) as {
-          providers: Record<string, { baseUrl?: string }>;
-        };
-
-        expect(parsed.providers["github-copilot"]?.baseUrl).toBe("https://api.copilot.example");
+        expect(await readCopilotBaseUrl(agentDir)).toBe("https://api.copilot.example");
       });
     });
   });

@@ -1,3 +1,4 @@
+import { roleScopesAllow } from "../../../src/shared/operator-scope-compat.js";
 import { refreshChat } from "./app-chat.ts";
 import {
   startLogsPolling,
@@ -12,7 +13,7 @@ import { loadAgentSkills } from "./controllers/agent-skills.ts";
 import { loadAgents } from "./controllers/agents.ts";
 import { loadChannels } from "./controllers/channels.ts";
 import { loadConfig, loadConfigSchema } from "./controllers/config.ts";
-import { loadCronJobs, loadCronStatus } from "./controllers/cron.ts";
+import { loadCronJobs, loadCronRuns, loadCronStatus } from "./controllers/cron.ts";
 import { loadDebug } from "./controllers/debug.ts";
 import { loadDevices } from "./controllers/devices.ts";
 import { loadExecApprovals } from "./controllers/exec-approvals.ts";
@@ -32,13 +33,15 @@ import {
 } from "./navigation.ts";
 import { saveSettings, type UiSettings } from "./storage.ts";
 import { startThemeTransition, type ThemeTransitionContext } from "./theme-transition.ts";
-import { resolveTheme, type ResolvedTheme, type ThemeMode } from "./theme.ts";
+import { resolveTheme, type ResolvedTheme, type ThemeMode, type ThemeName } from "./theme.ts";
 import type { AgentsListResult, AttentionItem } from "./types.ts";
+import { resetChatViewState } from "./views/chat.ts";
 
 type SettingsHost = {
   settings: UiSettings;
   password?: string;
-  theme: ThemeMode;
+  theme: ThemeName;
+  themeMode: ThemeMode;
   themeResolved: ResolvedTheme;
   applySessionKey: string;
   sessionKey: string;
@@ -53,6 +56,8 @@ type SettingsHost = {
   agentsSelectedId?: string | null;
   agentsPanel?: "overview" | "files" | "tools" | "skills" | "channels" | "cron";
   pendingGatewayUrl?: string | null;
+  systemThemeCleanup?: (() => void) | null;
+  pendingGatewayToken?: string | null;
 };
 
 export function applySettings(host: SettingsHost, next: UiSettings) {
@@ -62,10 +67,12 @@ export function applySettings(host: SettingsHost, next: UiSettings) {
   };
   host.settings = normalized;
   saveSettings(normalized);
-  if (next.theme !== host.theme) {
+  if (next.theme !== host.theme || next.themeMode !== host.themeMode) {
     host.theme = next.theme;
-    applyResolvedTheme(host, resolveTheme(next.theme));
+    host.themeMode = next.themeMode;
+    applyResolvedTheme(host, resolveTheme(next.theme, next.themeMode));
   }
+  applyBorderRadius(next.borderRadius);
   host.applySessionKey = host.settings.lastActiveSessionKey;
 }
 
@@ -88,20 +95,43 @@ export function applySettingsFromUrl(host: SettingsHost) {
   const params = new URLSearchParams(url.search);
   const hashParams = new URLSearchParams(url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
 
-  const tokenRaw = params.get("token") ?? hashParams.get("token");
+  const gatewayUrlRaw = params.get("gatewayUrl") ?? hashParams.get("gatewayUrl");
+  const nextGatewayUrl = gatewayUrlRaw?.trim() ?? "";
+  const gatewayUrlChanged = Boolean(nextGatewayUrl && nextGatewayUrl !== host.settings.gatewayUrl);
+  // Prefer fragment tokens over query tokens. Fragments avoid server-side request
+  // logs and referrer leakage; query-param tokens remain a one-time legacy fallback
+  // for compatibility with older deep links.
+  const tokenRaw = hashParams.get("token") ?? params.get("token");
   const passwordRaw = params.get("password") ?? hashParams.get("password");
   const sessionRaw = params.get("session") ?? hashParams.get("session");
-  const gatewayUrlRaw = params.get("gatewayUrl") ?? hashParams.get("gatewayUrl");
+  const shouldResetSessionForToken = Boolean(
+    tokenRaw?.trim() && !sessionRaw?.trim() && !gatewayUrlChanged,
+  );
   let shouldCleanUrl = false;
+
+  if (params.has("token")) {
+    params.delete("token");
+    shouldCleanUrl = true;
+  }
 
   if (tokenRaw != null) {
     const token = tokenRaw.trim();
-    if (token && token !== host.settings.token) {
+    if (token && gatewayUrlChanged) {
+      host.pendingGatewayToken = token;
+    } else if (token && token !== host.settings.token) {
       applySettings(host, { ...host.settings, token });
     }
-    params.delete("token");
     hashParams.delete("token");
     shouldCleanUrl = true;
+  }
+
+  if (shouldResetSessionForToken) {
+    host.sessionKey = "main";
+    applySettings(host, {
+      ...host.settings,
+      sessionKey: "main",
+      lastActiveSessionKey: "main",
+    });
   }
 
   if (passwordRaw != null) {
@@ -124,9 +154,14 @@ export function applySettingsFromUrl(host: SettingsHost) {
   }
 
   if (gatewayUrlRaw != null) {
-    const gatewayUrl = gatewayUrlRaw.trim();
-    if (gatewayUrl && gatewayUrl !== host.settings.gatewayUrl) {
-      host.pendingGatewayUrl = gatewayUrl;
+    if (gatewayUrlChanged) {
+      host.pendingGatewayUrl = nextGatewayUrl;
+      if (!tokenRaw?.trim()) {
+        host.pendingGatewayToken = null;
+      }
+    } else {
+      host.pendingGatewayUrl = null;
+      host.pendingGatewayToken = null;
     }
     params.delete("gatewayUrl");
     hashParams.delete("gatewayUrl");
@@ -143,38 +178,39 @@ export function applySettingsFromUrl(host: SettingsHost) {
 }
 
 export function setTab(host: SettingsHost, next: Tab) {
-  if (host.tab !== next) {
-    host.tab = next;
-  }
-  if (next === "chat") {
-    host.chatHasAutoScrolled = false;
-  }
-  if (next === "logs") {
-    startLogsPolling(host as unknown as Parameters<typeof startLogsPolling>[0]);
-  } else {
-    stopLogsPolling(host as unknown as Parameters<typeof stopLogsPolling>[0]);
-  }
-  if (next === "debug") {
-    startDebugPolling(host as unknown as Parameters<typeof startDebugPolling>[0]);
-  } else {
-    stopDebugPolling(host as unknown as Parameters<typeof stopDebugPolling>[0]);
-  }
-  void refreshActiveTab(host);
-  syncUrlWithTab(host, next, false);
+  applyTabSelection(host, next, { refreshPolicy: "always", syncUrl: true });
 }
 
-export function setTheme(host: SettingsHost, next: ThemeMode, context?: ThemeTransitionContext) {
+export function setTheme(host: SettingsHost, next: ThemeName, context?: ThemeTransitionContext) {
+  const resolved = resolveTheme(next, host.themeMode);
   const applyTheme = () => {
-    host.theme = next;
     applySettings(host, { ...host.settings, theme: next });
-    applyResolvedTheme(host, resolveTheme(next));
   };
   startThemeTransition({
-    nextTheme: next,
+    nextTheme: resolved,
     applyTheme,
     context,
-    currentTheme: host.theme,
+    currentTheme: host.themeResolved,
   });
+  syncSystemThemeListener(host);
+}
+
+export function setThemeMode(
+  host: SettingsHost,
+  next: ThemeMode,
+  context?: ThemeTransitionContext,
+) {
+  const resolved = resolveTheme(host.theme, next);
+  const applyMode = () => {
+    applySettings(host, { ...host.settings, themeMode: next });
+  };
+  startThemeTransition({
+    nextTheme: resolved,
+    applyTheme: applyMode,
+    context,
+    currentTheme: host.themeResolved,
+  });
+  syncSystemThemeListener(host);
 }
 
 export async function refreshActiveTab(host: SettingsHost) {
@@ -186,6 +222,9 @@ export async function refreshActiveTab(host: SettingsHost) {
   }
   if (host.tab === "instances") {
     await loadPresence(host as unknown as OpenClawApp);
+  }
+  if (host.tab === "usage") {
+    await loadUsage(host as unknown as OpenClawApp);
   }
   if (host.tab === "sessions") {
     await loadSessions(host as unknown as OpenClawApp);
@@ -231,7 +270,14 @@ export async function refreshActiveTab(host: SettingsHost) {
       !host.chatHasAutoScrolled,
     );
   }
-  if (host.tab === "config") {
+  if (
+    host.tab === "config" ||
+    host.tab === "communications" ||
+    host.tab === "appearance" ||
+    host.tab === "automation" ||
+    host.tab === "infrastructure" ||
+    host.tab === "aiAgents"
+  ) {
     await loadConfigSchema(host as unknown as OpenClawApp);
     await loadConfig(host as unknown as OpenClawApp);
   }
@@ -258,8 +304,35 @@ export function inferBasePath() {
 }
 
 export function syncThemeWithSettings(host: SettingsHost) {
-  host.theme = host.settings.theme ?? "dark";
-  applyResolvedTheme(host, resolveTheme(host.theme));
+  host.theme = host.settings.theme ?? "claw";
+  host.themeMode = host.settings.themeMode ?? "system";
+  applyResolvedTheme(host, resolveTheme(host.theme, host.themeMode));
+  applyBorderRadius(host.settings.borderRadius ?? 50);
+  syncSystemThemeListener(host);
+}
+
+export function attachThemeListener(host: SettingsHost) {
+  syncSystemThemeListener(host);
+}
+
+export function detachThemeListener(host: SettingsHost) {
+  host.systemThemeCleanup?.();
+  host.systemThemeCleanup = null;
+}
+
+const BASE_RADII = { sm: 6, md: 10, lg: 14, xl: 20, default: 10 };
+
+export function applyBorderRadius(value: number) {
+  if (typeof document === "undefined") {
+    return;
+  }
+  const root = document.documentElement;
+  const scale = value / 50;
+  root.style.setProperty("--radius-sm", `${Math.round(BASE_RADII.sm * scale)}px`);
+  root.style.setProperty("--radius-md", `${Math.round(BASE_RADII.md * scale)}px`);
+  root.style.setProperty("--radius-lg", `${Math.round(BASE_RADII.lg * scale)}px`);
+  root.style.setProperty("--radius-xl", `${Math.round(BASE_RADII.xl * scale)}px`);
+  root.style.setProperty("--radius", `${Math.round(BASE_RADII.default * scale)}px`);
 }
 
 export function applyResolvedTheme(host: SettingsHost, resolved: ResolvedTheme) {
@@ -268,8 +341,45 @@ export function applyResolvedTheme(host: SettingsHost, resolved: ResolvedTheme) 
     return;
   }
   const root = document.documentElement;
+  const themeMode = resolved.endsWith("light") ? "light" : "dark";
   root.dataset.theme = resolved;
-  root.style.colorScheme = "dark";
+  root.dataset.themeMode = themeMode;
+  root.style.colorScheme = themeMode;
+}
+
+function syncSystemThemeListener(host: SettingsHost) {
+  // Clean up existing listener if mode is not "system"
+  if (host.themeMode !== "system") {
+    host.systemThemeCleanup?.();
+    host.systemThemeCleanup = null;
+    return;
+  }
+
+  // Skip if listener already attached for this host
+  if (host.systemThemeCleanup) {
+    return;
+  }
+
+  if (typeof globalThis.matchMedia !== "function") {
+    return;
+  }
+
+  const mql = globalThis.matchMedia("(prefers-color-scheme: light)");
+  const onChange = () => {
+    if (host.themeMode !== "system") {
+      return;
+    }
+    applyResolvedTheme(host, resolveTheme(host.theme, "system"));
+  };
+  if (typeof mql.addEventListener === "function") {
+    mql.addEventListener("change", onChange);
+    host.systemThemeCleanup = () => mql.removeEventListener("change", onChange);
+    return;
+  }
+  if (typeof mql.addListener === "function") {
+    mql.addListener(onChange);
+    host.systemThemeCleanup = () => mql.removeListener(onChange);
+  }
 }
 
 export function syncTabWithLocation(host: SettingsHost, replace: boolean) {
@@ -305,9 +415,24 @@ export function onPopState(host: SettingsHost) {
 }
 
 export function setTabFromRoute(host: SettingsHost, next: Tab) {
+  applyTabSelection(host, next, { refreshPolicy: "connected" });
+}
+
+function applyTabSelection(
+  host: SettingsHost,
+  next: Tab,
+  options: { refreshPolicy: "always" | "connected"; syncUrl?: boolean },
+) {
+  const prev = host.tab;
   if (host.tab !== next) {
     host.tab = next;
   }
+
+  // Cleanup chat module state when navigating away from chat
+  if (prev === "chat" && next !== "chat") {
+    resetChatViewState();
+  }
+
   if (next === "chat") {
     host.chatHasAutoScrolled = false;
   }
@@ -321,8 +446,13 @@ export function setTabFromRoute(host: SettingsHost, next: Tab) {
   } else {
     stopDebugPolling(host as unknown as Parameters<typeof stopDebugPolling>[0]);
   }
-  if (host.connected) {
+
+  if (options.refreshPolicy === "always" || host.connected) {
     void refreshActiveTab(host);
+  }
+
+  if (options.syncUrl) {
+    syncUrlWithTab(host, next, false);
   }
 }
 
@@ -380,6 +510,28 @@ export async function loadOverview(host: SettingsHost) {
   buildAttentionItems(app);
 }
 
+export function hasOperatorReadAccess(
+  auth: { role?: string; scopes?: readonly string[] } | null,
+): boolean {
+  if (!auth?.scopes) {
+    return false;
+  }
+  return roleScopesAllow({
+    role: auth.role ?? "operator",
+    requestedScopes: ["operator.read"],
+    allowedScopes: auth.scopes,
+  });
+}
+
+export function hasMissingSkillDependencies(
+  missing: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!missing) {
+    return false;
+  }
+  return Object.values(missing).some((value) => Array.isArray(value) && value.length > 0);
+}
+
 async function loadOverviewLogs(host: OpenClawApp) {
   if (!host.client || !host.connected) {
     return;
@@ -419,8 +571,8 @@ function buildAttentionItems(host: OpenClawApp) {
   }
 
   const hello = host.hello;
-  const auth = (hello as { auth?: { scopes?: string[] } } | null)?.auth;
-  if (auth?.scopes && !auth.scopes.includes("operator.read")) {
+  const auth = (hello as { auth?: { role?: string; scopes?: string[] } } | null)?.auth ?? null;
+  if (auth?.scopes && !hasOperatorReadAccess(auth)) {
     items.push({
       severity: "warning",
       icon: "key",
@@ -433,7 +585,7 @@ function buildAttentionItems(host: OpenClawApp) {
   }
 
   const skills = host.skillsReport?.skills ?? [];
-  const missingDeps = skills.filter((s) => !s.disabled && Object.keys(s.missing).length > 0);
+  const missingDeps = skills.filter((s) => !s.disabled && hasMissingSkillDependencies(s.missing));
   if (missingDeps.length > 0) {
     const names = missingDeps.slice(0, 3).map((s) => s.name);
     const more = missingDeps.length > 3 ? ` +${missingDeps.length - 3} more` : "";
@@ -491,9 +643,12 @@ export async function loadChannelsTab(host: SettingsHost) {
 }
 
 export async function loadCron(host: SettingsHost) {
+  const app = host as unknown as OpenClawApp;
+  const activeCronJobId = app.cronRunsScope === "job" ? app.cronRunsJobId : null;
   await Promise.all([
-    loadChannels(host as unknown as OpenClawApp, false),
-    loadCronStatus(host as unknown as OpenClawApp),
-    loadCronJobs(host as unknown as OpenClawApp),
+    loadChannels(app, false),
+    loadCronStatus(app),
+    loadCronJobs(app),
+    loadCronRuns(app, activeCronJobId),
   ]);
 }

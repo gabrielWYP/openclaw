@@ -1,7 +1,12 @@
 import { html, nothing, type TemplateResult } from "lit";
 import { ref } from "lit/directives/ref.js";
 import { repeat } from "lit/directives/repeat.js";
+import {
+  CHAT_ATTACHMENT_ACCEPT,
+  isSupportedChatAttachmentMimeType,
+} from "../chat/attachment-support.ts";
 import { DeletedMessages } from "../chat/deleted-messages.ts";
+import { exportChatMarkdown } from "../chat/export.ts";
 import {
   renderMessageGroup,
   renderReadingIndicatorGroup,
@@ -10,17 +15,23 @@ import {
 import { InputHistory } from "../chat/input-history.ts";
 import { normalizeMessage, normalizeRoleForGrouping } from "../chat/message-normalizer.ts";
 import { PinnedMessages } from "../chat/pinned-messages.ts";
+import { getPinnedMessageSummary } from "../chat/pinned-summary.ts";
+import { messageMatchesSearchQuery } from "../chat/search-match.ts";
+import { getOrCreateSessionCacheValue } from "../chat/session-cache.ts";
 import {
   CATEGORY_LABELS,
+  SLASH_COMMANDS,
   getSlashCommandCompletions,
   type SlashCommandCategory,
   type SlashCommandDef,
 } from "../chat/slash-commands.ts";
+import { isSttSupported, startStt, stopStt } from "../chat/speech.ts";
 import { icons } from "../icons.ts";
 import { detectTextDirection } from "../text-direction.ts";
-import type { SessionsListResult } from "../types.ts";
+import type { GatewaySessionRow, SessionsListResult } from "../types.ts";
 import type { ChatItem, MessageGroup } from "../types/chat-types.ts";
 import type { ChatAttachment, ChatQueueItem } from "../ui-types.ts";
+import { agentLogoUrl, resolveAgentAvatarUrl } from "./agents-utils.ts";
 import { renderMarkdownSidebar } from "./markdown-sidebar.ts";
 import "../components/resizable-divider.ts";
 
@@ -45,6 +56,7 @@ export type ChatProps = {
   onSessionKeyChange: (next: string) => void;
   thinkingLevel: string | null;
   showThinking: boolean;
+  showToolCalls: boolean;
   loading: boolean;
   sending: boolean;
   canAbort?: boolean;
@@ -52,6 +64,7 @@ export type ChatProps = {
   fallbackStatus?: FallbackIndicatorStatus | null;
   messages: unknown[];
   toolMessages: unknown[];
+  streamSegments: Array<{ text: string; ts: number }>;
   stream: string | null;
   streamStartedAt: number | null;
   assistantAvatarUrl?: string | null;
@@ -75,7 +88,9 @@ export type ChatProps = {
   onScrollToBottom?: () => void;
   onRefresh: () => void;
   onToggleFocusMode: () => void;
+  getDraft?: () => string;
   onDraftChange: (next: string) => void;
+  onRequestUpdate?: () => void;
   onSend: () => void;
   onAbort?: () => void;
   onQueueRemove: (id: string) => void;
@@ -93,6 +108,7 @@ export type ChatProps = {
   onCloseSidebar?: () => void;
   onSplitRatioChange?: (ratio: number) => void;
   onChatScroll?: (event: Event) => void;
+  basePath?: string;
 };
 
 const COMPACTION_TOAST_DURATION_MS = 5000;
@@ -104,42 +120,69 @@ const pinnedMessagesMap = new Map<string, PinnedMessages>();
 const deletedMessagesMap = new Map<string, DeletedMessages>();
 
 function getInputHistory(sessionKey: string): InputHistory {
-  let h = inputHistories.get(sessionKey);
-  if (!h) {
-    h = new InputHistory();
-    inputHistories.set(sessionKey, h);
-  }
-  return h;
+  return getOrCreateSessionCacheValue(inputHistories, sessionKey, () => new InputHistory());
 }
 
 function getPinnedMessages(sessionKey: string): PinnedMessages {
-  let p = pinnedMessagesMap.get(sessionKey);
-  if (!p) {
-    p = new PinnedMessages(sessionKey);
-    pinnedMessagesMap.set(sessionKey, p);
-  }
-  return p;
+  return getOrCreateSessionCacheValue(
+    pinnedMessagesMap,
+    sessionKey,
+    () => new PinnedMessages(sessionKey),
+  );
 }
 
 function getDeletedMessages(sessionKey: string): DeletedMessages {
-  let d = deletedMessagesMap.get(sessionKey);
-  if (!d) {
-    d = new DeletedMessages(sessionKey);
-    deletedMessagesMap.set(sessionKey, d);
-  }
-  return d;
+  return getOrCreateSessionCacheValue(
+    deletedMessagesMap,
+    sessionKey,
+    () => new DeletedMessages(sessionKey),
+  );
 }
 
-// Module-level ephemeral UI state (reset on navigation away)
-let slashMenuOpen = false;
-let slashMenuItems: SlashCommandDef[] = [];
-let slashMenuIndex = 0;
-let searchOpen = false;
-let searchQuery = "";
-let pinnedExpanded = false;
-let voiceActive = false;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let recognition: any = null;
+interface ChatEphemeralState {
+  sttRecording: boolean;
+  sttInterimText: string;
+  slashMenuOpen: boolean;
+  slashMenuItems: SlashCommandDef[];
+  slashMenuIndex: number;
+  slashMenuMode: "command" | "args";
+  slashMenuCommand: SlashCommandDef | null;
+  slashMenuArgItems: string[];
+  searchOpen: boolean;
+  searchQuery: string;
+  pinnedExpanded: boolean;
+}
+
+function createChatEphemeralState(): ChatEphemeralState {
+  return {
+    sttRecording: false,
+    sttInterimText: "",
+    slashMenuOpen: false,
+    slashMenuItems: [],
+    slashMenuIndex: 0,
+    slashMenuMode: "command",
+    slashMenuCommand: null,
+    slashMenuArgItems: [],
+    searchOpen: false,
+    searchQuery: "",
+    pinnedExpanded: false,
+  };
+}
+
+const vs = createChatEphemeralState();
+
+/**
+ * Reset chat view ephemeral state when navigating away.
+ * Stops STT recording and clears search/slash UI that should not survive navigation.
+ */
+export function resetChatViewState() {
+  if (vs.sttRecording) {
+    stopStt();
+  }
+  Object.assign(vs, createChatEphemeralState());
+}
+
+export const cleanupChatModuleState = resetChatViewState;
 
 function adjustTextareaHeight(el: HTMLTextAreaElement) {
   el.style.height = "auto";
@@ -204,6 +247,91 @@ function renderFallbackIndicator(status: FallbackIndicatorStatus | null | undefi
   `;
 }
 
+/**
+ * Compact notice when context usage reaches 85%+.
+ * Progressively shifts from amber (85%) to red (90%+).
+ */
+/** Parse a 6-digit CSS hex color string to [r, g, b] integer components. */
+function parseHexRgb(hex: string): [number, number, number] | null {
+  const h = hex.trim().replace(/^#/, "");
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) {
+    return null;
+  }
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+
+let cachedThemeNoticeColors: {
+  warnHex: string;
+  dangerHex: string;
+  warnRgb: [number, number, number];
+  dangerRgb: [number, number, number];
+} | null = null;
+
+function getThemeNoticeColors() {
+  if (cachedThemeNoticeColors) {
+    return cachedThemeNoticeColors;
+  }
+  const rootStyle = getComputedStyle(document.documentElement);
+  const warnHex = rootStyle.getPropertyValue("--warn").trim() || "#f59e0b";
+  const dangerHex = rootStyle.getPropertyValue("--danger").trim() || "#ef4444";
+  cachedThemeNoticeColors = {
+    warnHex,
+    dangerHex,
+    warnRgb: parseHexRgb(warnHex) ?? [245, 158, 11],
+    dangerRgb: parseHexRgb(dangerHex) ?? [239, 68, 68],
+  };
+  return cachedThemeNoticeColors;
+}
+
+function renderContextNotice(
+  session: GatewaySessionRow | undefined,
+  defaultContextTokens: number | null,
+) {
+  if (session?.totalTokensFresh === false) {
+    return nothing;
+  }
+  const used = session?.totalTokens ?? 0;
+  const limit = session?.contextTokens ?? defaultContextTokens ?? 0;
+  if (!used || !limit) {
+    return nothing;
+  }
+  const ratio = used / limit;
+  if (ratio < 0.85) {
+    return nothing;
+  }
+  const pct = Math.min(Math.round(ratio * 100), 100);
+  // Read theme semantic tokens so color tracks the active theme (Dash, dark, light …)
+  const { warnRgb, dangerRgb } = getThemeNoticeColors();
+  const [wr, wg, wb] = warnRgb;
+  const [dr, dg, db] = dangerRgb;
+  // Blend from --warn at 85% usage to --danger at 95%+ usage
+  const t = Math.min(Math.max((ratio - 0.85) / 0.1, 0), 1);
+  const r = Math.round(wr + (dr - wr) * t);
+  const g = Math.round(wg + (dg - wg) * t);
+  const b = Math.round(wb + (db - wb) * t);
+  const color = `rgb(${r}, ${g}, ${b})`;
+  const bgOpacity = 0.08 + 0.08 * t;
+  const bg = `rgba(${r}, ${g}, ${b}, ${bgOpacity})`;
+  return html`
+    <div class="context-notice" role="status" style="--ctx-color:${color};--ctx-bg:${bg}">
+      <svg class="context-notice__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span>${pct}% context used</span>
+      <span class="context-notice__detail">${formatTokensCompact(used)} / ${formatTokensCompact(limit)}</span>
+    </div>
+  `;
+}
+
+/** Format token count compactly (e.g. 128000 → "128k"). */
+function formatTokensCompact(n: number): string {
+  if (n >= 1_000_000) {
+    return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  }
+  if (n >= 1_000) {
+    return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return String(n);
+}
+
 function generateAttachmentId(): string {
   return `att-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
@@ -253,6 +381,9 @@ function handleFileSelect(e: Event, props: ChatProps) {
   const additions: ChatAttachment[] = [];
   let pending = 0;
   for (const file of input.files) {
+    if (!isSupportedChatAttachmentMimeType(file.type)) {
+      continue;
+    }
     pending++;
     const reader = new FileReader();
     reader.addEventListener("load", () => {
@@ -281,7 +412,7 @@ function handleDrop(e: DragEvent, props: ChatProps) {
   const additions: ChatAttachment[] = [];
   let pending = 0;
   for (const file of files) {
-    if (!file.type.startsWith("image/")) {
+    if (!isSupportedChatAttachmentMimeType(file.type)) {
       continue;
     }
     pending++;
@@ -328,16 +459,54 @@ function renderAttachmentPreview(props: ChatProps): TemplateResult | typeof noth
   `;
 }
 
+function resetSlashMenuState(): void {
+  vs.slashMenuMode = "command";
+  vs.slashMenuCommand = null;
+  vs.slashMenuArgItems = [];
+  vs.slashMenuItems = [];
+}
+
 function updateSlashMenu(value: string, requestUpdate: () => void): void {
+  // Arg mode: /command <partial-arg>
+  const argMatch = value.match(/^\/(\S+)\s(.*)$/);
+  if (argMatch) {
+    const cmdName = argMatch[1].toLowerCase();
+    const argFilter = argMatch[2].toLowerCase();
+    const cmd = SLASH_COMMANDS.find((c) => c.name === cmdName);
+    if (cmd?.argOptions?.length) {
+      const filtered = argFilter
+        ? cmd.argOptions.filter((opt) => opt.toLowerCase().startsWith(argFilter))
+        : cmd.argOptions;
+      if (filtered.length > 0) {
+        vs.slashMenuMode = "args";
+        vs.slashMenuCommand = cmd;
+        vs.slashMenuArgItems = filtered;
+        vs.slashMenuOpen = true;
+        vs.slashMenuIndex = 0;
+        vs.slashMenuItems = [];
+        requestUpdate();
+        return;
+      }
+    }
+    vs.slashMenuOpen = false;
+    resetSlashMenuState();
+    requestUpdate();
+    return;
+  }
+
+  // Command mode: /partial-command
   const match = value.match(/^\/(\S*)$/);
   if (match) {
     const items = getSlashCommandCompletions(match[1]);
-    slashMenuItems = items;
-    slashMenuOpen = items.length > 0;
-    slashMenuIndex = 0;
+    vs.slashMenuItems = items;
+    vs.slashMenuOpen = items.length > 0;
+    vs.slashMenuIndex = 0;
+    vs.slashMenuMode = "command";
+    vs.slashMenuCommand = null;
+    vs.slashMenuArgItems = [];
   } else {
-    slashMenuOpen = false;
-    slashMenuItems = [];
+    vs.slashMenuOpen = false;
+    resetSlashMenuState();
   }
   requestUpdate();
 }
@@ -347,11 +516,70 @@ function selectSlashCommand(
   props: ChatProps,
   requestUpdate: () => void,
 ): void {
-  const text = `/${cmd.name} `;
-  props.onDraftChange(text);
-  slashMenuOpen = false;
-  slashMenuItems = [];
+  // Transition to arg picker when the command has fixed options
+  if (cmd.argOptions?.length) {
+    props.onDraftChange(`/${cmd.name} `);
+    vs.slashMenuMode = "args";
+    vs.slashMenuCommand = cmd;
+    vs.slashMenuArgItems = cmd.argOptions;
+    vs.slashMenuOpen = true;
+    vs.slashMenuIndex = 0;
+    vs.slashMenuItems = [];
+    requestUpdate();
+    return;
+  }
+
+  vs.slashMenuOpen = false;
+  resetSlashMenuState();
+
+  if (cmd.executeLocal && !cmd.args) {
+    props.onDraftChange(`/${cmd.name}`);
+    requestUpdate();
+    props.onSend();
+  } else {
+    props.onDraftChange(`/${cmd.name} `);
+    requestUpdate();
+  }
+}
+
+function tabCompleteSlashCommand(
+  cmd: SlashCommandDef,
+  props: ChatProps,
+  requestUpdate: () => void,
+): void {
+  // Tab: fill in the command text without executing
+  if (cmd.argOptions?.length) {
+    props.onDraftChange(`/${cmd.name} `);
+    vs.slashMenuMode = "args";
+    vs.slashMenuCommand = cmd;
+    vs.slashMenuArgItems = cmd.argOptions;
+    vs.slashMenuOpen = true;
+    vs.slashMenuIndex = 0;
+    vs.slashMenuItems = [];
+    requestUpdate();
+    return;
+  }
+
+  vs.slashMenuOpen = false;
+  resetSlashMenuState();
+  props.onDraftChange(cmd.args ? `/${cmd.name} ` : `/${cmd.name}`);
   requestUpdate();
+}
+
+function selectSlashArg(
+  arg: string,
+  props: ChatProps,
+  requestUpdate: () => void,
+  execute: boolean,
+): void {
+  const cmdName = vs.slashMenuCommand?.name ?? "";
+  vs.slashMenuOpen = false;
+  resetSlashMenuState();
+  props.onDraftChange(`/${cmdName} ${arg}`);
+  requestUpdate();
+  if (execute) {
+    props.onSend();
+  }
 }
 
 function tokenEstimate(draft: string): string | null {
@@ -361,78 +589,29 @@ function tokenEstimate(draft: string): string | null {
   return `~${Math.ceil(draft.length / 4)} tokens`;
 }
 
-function startVoice(props: ChatProps, requestUpdate: () => void): void {
-  const SR =
-    (window as unknown as Record<string, unknown>).webkitSpeechRecognition ??
-    (window as unknown as Record<string, unknown>).SpeechRecognition;
-  if (!SR) {
-    return;
-  }
-  const rec = new (SR as new () => Record<string, unknown>)();
-  rec.continuous = false;
-  rec.interimResults = true;
-  rec.lang = "en-US";
-  rec.onresult = (event: Record<string, unknown>) => {
-    let transcript = "";
-    const results = (
-      event as { results: { length: number; [i: number]: { 0: { transcript: string } } } }
-    ).results;
-    for (let i = 0; i < results.length; i++) {
-      transcript += results[i][0].transcript;
-    }
-    props.onDraftChange(transcript);
-  };
-  (rec as unknown as EventTarget).addEventListener("end", () => {
-    voiceActive = false;
-    recognition = null;
-    requestUpdate();
-  });
-  (rec as unknown as EventTarget).addEventListener("error", () => {
-    voiceActive = false;
-    recognition = null;
-    requestUpdate();
-  });
-  (rec as { start: () => void }).start();
-  recognition = rec;
-  voiceActive = true;
-  requestUpdate();
-}
-
-function stopVoice(requestUpdate: () => void): void {
-  if (recognition && typeof recognition.stop === "function") {
-    recognition.stop();
-  }
-  recognition = null;
-  voiceActive = false;
-  requestUpdate();
-}
-
+/**
+ * Export chat markdown - delegates to shared utility.
+ */
 function exportMarkdown(props: ChatProps): void {
-  const history = Array.isArray(props.messages) ? props.messages : [];
-  if (history.length === 0) {
-    return;
-  }
-  const lines: string[] = [`# Chat with ${props.assistantName}`, ""];
-  for (const msg of history) {
-    const m = msg as Record<string, unknown>;
-    const role = m.role === "user" ? "You" : m.role === "assistant" ? props.assistantName : "Tool";
-    const content = typeof m.content === "string" ? m.content : "";
-    const ts = typeof m.timestamp === "number" ? new Date(m.timestamp).toISOString() : "";
-    lines.push(`## ${role}${ts ? ` (${ts})` : ""}`, "", content, "");
-  }
-  const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `chat-${props.assistantName}-${Date.now()}.md`;
-  a.click();
-  URL.revokeObjectURL(url);
+  exportChatMarkdown(props.messages, props.assistantName);
 }
+
+const WELCOME_SUGGESTIONS = [
+  "What can you do?",
+  "Summarize my recent sessions",
+  "Help me configure a channel",
+  "Check system health",
+];
 
 function renderWelcomeState(props: ChatProps): TemplateResult {
   const name = props.assistantName || "Assistant";
-  const avatar = props.assistantAvatar ?? props.assistantAvatarUrl;
-  const initials = name.slice(0, 2).toUpperCase();
+  const avatar = resolveAgentAvatarUrl({
+    identity: {
+      avatar: props.assistantAvatar ?? undefined,
+      avatarUrl: props.assistantAvatarUrl ?? undefined,
+    },
+  });
+  const logoUrl = agentLogoUrl(props.basePath ?? "");
 
   return html`
     <div class="agent-chat__welcome" style="--agent-color: var(--accent)">
@@ -440,21 +619,35 @@ function renderWelcomeState(props: ChatProps): TemplateResult {
       ${
         avatar
           ? html`<img src=${avatar} alt=${name} style="width:56px; height:56px; border-radius:50%; object-fit:cover;" />`
-          : html`<div class="agent-chat__avatar">${initials}</div>`
+          : html`<div class="agent-chat__avatar agent-chat__avatar--logo"><img src=${logoUrl} alt="OpenClaw" /></div>`
       }
       <h2>${name}</h2>
       <div class="agent-chat__badges">
-        <span class="agent-chat__badge">${icons.spark} Ready to chat</span>
+        <span class="agent-chat__badge"><img src=${logoUrl} alt="" /> Ready to chat</span>
       </div>
       <p class="agent-chat__hint">
         Type a message below &middot; <kbd>/</kbd> for commands
       </p>
+      <div class="agent-chat__suggestions">
+        ${WELCOME_SUGGESTIONS.map(
+          (text) => html`
+            <button
+              type="button"
+              class="agent-chat__suggestion"
+              @click=${() => {
+                props.onDraftChange(text);
+                props.onSend();
+              }}
+            >${text}</button>
+          `,
+        )}
+      </div>
     </div>
   `;
 }
 
 function renderSearchBar(requestUpdate: () => void): TemplateResult | typeof nothing {
-  if (!searchOpen) {
+  if (!vs.searchOpen) {
     return nothing;
   }
   return html`
@@ -463,15 +656,15 @@ function renderSearchBar(requestUpdate: () => void): TemplateResult | typeof not
       <input
         type="text"
         placeholder="Search messages..."
-        .value=${searchQuery}
+        .value=${vs.searchQuery}
         @input=${(e: Event) => {
-          searchQuery = (e.target as HTMLInputElement).value;
+          vs.searchQuery = (e.target as HTMLInputElement).value;
           requestUpdate();
         }}
       />
       <button class="btn-ghost" @click=${() => {
-        searchOpen = false;
-        searchQuery = "";
+        vs.searchOpen = false;
+        vs.searchQuery = "";
         requestUpdate();
       }}>
         ${icons.x}
@@ -492,7 +685,7 @@ function renderPinnedSection(
     if (!msg) {
       continue;
     }
-    const text = typeof msg.content === "string" ? msg.content : "";
+    const text = getPinnedMessageSummary(msg);
     const role = typeof msg.role === "string" ? msg.role : "unknown";
     entries.push({ index: idx, text, role });
   }
@@ -502,15 +695,15 @@ function renderPinnedSection(
   return html`
     <div class="agent-chat__pinned">
       <button class="agent-chat__pinned-toggle" @click=${() => {
-        pinnedExpanded = !pinnedExpanded;
+        vs.pinnedExpanded = !vs.pinnedExpanded;
         requestUpdate();
       }}>
         ${icons.bookmark}
         ${entries.length} pinned
-        ${pinnedExpanded ? icons.chevronDown : icons.chevronRight}
+        <span class="collapse-chevron ${vs.pinnedExpanded ? "" : "collapse-chevron--collapsed"}">${icons.chevronDown}</span>
       </button>
       ${
-        pinnedExpanded
+        vs.pinnedExpanded
           ? html`
             <div class="agent-chat__pinned-list">
               ${entries.map(
@@ -539,7 +732,45 @@ function renderSlashMenu(
   requestUpdate: () => void,
   props: ChatProps,
 ): TemplateResult | typeof nothing {
-  if (!slashMenuOpen || slashMenuItems.length === 0) {
+  if (!vs.slashMenuOpen) {
+    return nothing;
+  }
+
+  // Arg-picker mode: show options for the selected command
+  if (vs.slashMenuMode === "args" && vs.slashMenuCommand && vs.slashMenuArgItems.length > 0) {
+    return html`
+      <div class="slash-menu">
+        <div class="slash-menu-group">
+          <div class="slash-menu-group__label">/${vs.slashMenuCommand.name} ${vs.slashMenuCommand.description}</div>
+          ${vs.slashMenuArgItems.map(
+            (arg, i) => html`
+              <div
+                class="slash-menu-item ${i === vs.slashMenuIndex ? "slash-menu-item--active" : ""}"
+                @click=${() => selectSlashArg(arg, props, requestUpdate, true)}
+                @mouseenter=${() => {
+                  vs.slashMenuIndex = i;
+                  requestUpdate();
+                }}
+              >
+                ${vs.slashMenuCommand?.icon ? html`<span class="slash-menu-icon">${icons[vs.slashMenuCommand.icon]}</span>` : nothing}
+                <span class="slash-menu-name">${arg}</span>
+                <span class="slash-menu-desc">/${vs.slashMenuCommand?.name} ${arg}</span>
+              </div>
+            `,
+          )}
+        </div>
+        <div class="slash-menu-footer">
+          <kbd>↑↓</kbd> navigate
+          <kbd>Tab</kbd> fill
+          <kbd>Enter</kbd> run
+          <kbd>Esc</kbd> close
+        </div>
+      </div>
+    `;
+  }
+
+  // Command mode: show grouped commands
+  if (vs.slashMenuItems.length === 0) {
     return nothing;
   }
 
@@ -547,8 +778,8 @@ function renderSlashMenu(
     SlashCommandCategory,
     Array<{ cmd: SlashCommandDef; globalIdx: number }>
   >();
-  for (let i = 0; i < slashMenuItems.length; i++) {
-    const cmd = slashMenuItems[i];
+  for (let i = 0; i < vs.slashMenuItems.length; i++) {
+    const cmd = vs.slashMenuItems[i];
     const cat = cmd.category ?? "session";
     let list = grouped.get(cat);
     if (!list) {
@@ -566,10 +797,10 @@ function renderSlashMenu(
         ${entries.map(
           ({ cmd, globalIdx }) => html`
             <div
-              class="slash-menu-item ${globalIdx === slashMenuIndex ? "slash-menu-item--active" : ""}"
+              class="slash-menu-item ${globalIdx === vs.slashMenuIndex ? "slash-menu-item--active" : ""}"
               @click=${() => selectSlashCommand(cmd, props, requestUpdate)}
               @mouseenter=${() => {
-                slashMenuIndex = globalIdx;
+                vs.slashMenuIndex = globalIdx;
                 requestUpdate();
               }}
             >
@@ -577,6 +808,15 @@ function renderSlashMenu(
               <span class="slash-menu-name">/${cmd.name}</span>
               ${cmd.args ? html`<span class="slash-menu-args">${cmd.args}</span>` : nothing}
               <span class="slash-menu-desc">${cmd.description}</span>
+              ${
+                cmd.argOptions?.length
+                  ? html`<span class="slash-menu-badge">${cmd.argOptions.length} options</span>`
+                  : cmd.executeLocal && !cmd.args
+                    ? html`
+                        <span class="slash-menu-badge">instant</span>
+                      `
+                    : nothing
+              }
             </div>
           `,
         )}
@@ -584,7 +824,17 @@ function renderSlashMenu(
     `);
   }
 
-  return html`<div class="slash-menu">${sections}</div>`;
+  return html`
+    <div class="slash-menu">
+      ${sections}
+      <div class="slash-menu-footer">
+        <kbd>↑↓</kbd> navigate
+        <kbd>Tab</kbd> fill
+        <kbd>Enter</kbd> select
+        <kbd>Esc</kbd> close
+      </div>
+    </div>
+  `;
 }
 
 export function renderChat(props: ChatProps) {
@@ -596,7 +846,13 @@ export function renderChat(props: ChatProps) {
   const showReasoning = props.showThinking && reasoningLevel !== "off";
   const assistantIdentity = {
     name: props.assistantName,
-    avatar: props.assistantAvatar ?? props.assistantAvatarUrl ?? null,
+    avatar:
+      resolveAgentAvatarUrl({
+        identity: {
+          avatar: props.assistantAvatar ?? undefined,
+          avatarUrl: props.assistantAvatarUrl ?? undefined,
+        },
+      }) ?? null,
   };
   const pinned = getPinnedMessages(props.sessionKey);
   const deleted = getDeletedMessages(props.sessionKey);
@@ -604,25 +860,32 @@ export function renderChat(props: ChatProps) {
   const hasAttachments = (props.attachments?.length ?? 0) > 0;
   const tokens = tokenEstimate(props.draft);
 
-  const hasVoice =
-    typeof (window as unknown as Record<string, unknown>).webkitSpeechRecognition !== "undefined" ||
-    typeof (window as unknown as Record<string, unknown>).SpeechRecognition !== "undefined";
-
   const placeholder = props.connected
     ? hasAttachments
       ? "Add a message or paste more images..."
       : `Message ${props.assistantName || "agent"} (Enter to send)`
     : "Connect to the gateway to start chatting...";
 
-  // We need a requestUpdate shim since we're in functional mode:
-  // the host Lit component will re-render on state change anyway,
-  // so we trigger by calling onDraftChange with current value.
-  const requestUpdate = () => {
-    props.onDraftChange(props.draft);
-  };
+  const requestUpdate = props.onRequestUpdate ?? (() => {});
+  const getDraft = props.getDraft ?? (() => props.draft);
 
   const splitRatio = props.splitRatio ?? 0.6;
   const sidebarOpen = Boolean(props.sidebarOpen && props.onCloseSidebar);
+
+  const handleCodeBlockCopy = (e: Event) => {
+    const btn = (e.target as HTMLElement).closest(".code-block-copy");
+    if (!btn) {
+      return;
+    }
+    const code = (btn as HTMLElement).dataset.code ?? "";
+    navigator.clipboard.writeText(code).then(
+      () => {
+        btn.classList.add("copied");
+        setTimeout(() => btn.classList.remove("copied"), 1500);
+      },
+      () => {},
+    );
+  };
 
   const chatItems = buildChatItems(props);
   const isEmpty = chatItems.length === 0 && !props.loading;
@@ -633,17 +896,44 @@ export function renderChat(props: ChatProps) {
       role="log"
       aria-live="polite"
       @scroll=${props.onChatScroll}
+      @click=${handleCodeBlockCopy}
     >
+      <div class="chat-thread-inner">
       ${
         props.loading
           ? html`
-              <div class="muted">Loading chat...</div>
+              <div class="chat-loading-skeleton" aria-label="Loading chat">
+                <div class="chat-line assistant">
+                  <div class="chat-msg">
+                    <div class="chat-bubble">
+                      <div class="skeleton skeleton-line skeleton-line--long" style="margin-bottom: 8px"></div>
+                      <div class="skeleton skeleton-line skeleton-line--medium" style="margin-bottom: 8px"></div>
+                      <div class="skeleton skeleton-line skeleton-line--short"></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="chat-line user" style="margin-top: 12px">
+                  <div class="chat-msg">
+                    <div class="chat-bubble">
+                      <div class="skeleton skeleton-line skeleton-line--medium"></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="chat-line assistant" style="margin-top: 12px">
+                  <div class="chat-msg">
+                    <div class="chat-bubble">
+                      <div class="skeleton skeleton-line skeleton-line--long" style="margin-bottom: 8px"></div>
+                      <div class="skeleton skeleton-line skeleton-line--short"></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
             `
           : nothing
       }
-      ${isEmpty && !searchOpen ? renderWelcomeState(props) : nothing}
+      ${isEmpty && !vs.searchOpen ? renderWelcomeState(props) : nothing}
       ${
-        isEmpty && searchOpen
+        isEmpty && vs.searchOpen
           ? html`
               <div class="agent-chat__empty">No matching messages</div>
             `
@@ -663,7 +953,7 @@ export function renderChat(props: ChatProps) {
             `;
           }
           if (item.kind === "reading-indicator") {
-            return renderReadingIndicatorGroup(assistantIdentity);
+            return renderReadingIndicatorGroup(assistantIdentity, props.basePath);
           }
           if (item.kind === "stream") {
             return renderStreamingGroup(
@@ -671,6 +961,7 @@ export function renderChat(props: ChatProps) {
               item.startedAt,
               props.onOpenSidebar,
               assistantIdentity,
+              props.basePath,
             );
           }
           if (item.kind === "group") {
@@ -680,8 +971,12 @@ export function renderChat(props: ChatProps) {
             return renderMessageGroup(item, {
               onOpenSidebar: props.onOpenSidebar,
               showReasoning,
+              showToolCalls: props.showToolCalls,
               assistantName: props.assistantName,
               assistantAvatar: assistantIdentity.avatar,
+              basePath: props.basePath,
+              contextWindow:
+                activeSession?.contextTokens ?? props.sessions?.defaults?.contextTokens ?? null,
               onDelete: () => {
                 deleted.delete(item.key);
                 requestUpdate();
@@ -691,32 +986,68 @@ export function renderChat(props: ChatProps) {
           return nothing;
         },
       )}
+      </div>
     </div>
   `;
 
   const handleKeyDown = (e: KeyboardEvent) => {
-    // Slash menu navigation
-    if (slashMenuOpen && slashMenuItems.length > 0) {
-      const len = slashMenuItems.length;
+    // Slash menu navigation — arg mode
+    if (vs.slashMenuOpen && vs.slashMenuMode === "args" && vs.slashMenuArgItems.length > 0) {
+      const len = vs.slashMenuArgItems.length;
       switch (e.key) {
         case "ArrowDown":
           e.preventDefault();
-          slashMenuIndex = (slashMenuIndex + 1) % len;
+          vs.slashMenuIndex = (vs.slashMenuIndex + 1) % len;
           requestUpdate();
           return;
         case "ArrowUp":
           e.preventDefault();
-          slashMenuIndex = (slashMenuIndex - 1 + len) % len;
+          vs.slashMenuIndex = (vs.slashMenuIndex - 1 + len) % len;
           requestUpdate();
           return;
-        case "Enter":
         case "Tab":
           e.preventDefault();
-          selectSlashCommand(slashMenuItems[slashMenuIndex], props, requestUpdate);
+          selectSlashArg(vs.slashMenuArgItems[vs.slashMenuIndex], props, requestUpdate, false);
+          return;
+        case "Enter":
+          e.preventDefault();
+          selectSlashArg(vs.slashMenuArgItems[vs.slashMenuIndex], props, requestUpdate, true);
           return;
         case "Escape":
           e.preventDefault();
-          slashMenuOpen = false;
+          vs.slashMenuOpen = false;
+          resetSlashMenuState();
+          requestUpdate();
+          return;
+      }
+    }
+
+    // Slash menu navigation — command mode
+    if (vs.slashMenuOpen && vs.slashMenuItems.length > 0) {
+      const len = vs.slashMenuItems.length;
+      switch (e.key) {
+        case "ArrowDown":
+          e.preventDefault();
+          vs.slashMenuIndex = (vs.slashMenuIndex + 1) % len;
+          requestUpdate();
+          return;
+        case "ArrowUp":
+          e.preventDefault();
+          vs.slashMenuIndex = (vs.slashMenuIndex - 1 + len) % len;
+          requestUpdate();
+          return;
+        case "Tab":
+          e.preventDefault();
+          tabCompleteSlashCommand(vs.slashMenuItems[vs.slashMenuIndex], props, requestUpdate);
+          return;
+        case "Enter":
+          e.preventDefault();
+          selectSlashCommand(vs.slashMenuItems[vs.slashMenuIndex], props, requestUpdate);
+          return;
+        case "Escape":
+          e.preventDefault();
+          vs.slashMenuOpen = false;
+          resetSlashMenuState();
           requestUpdate();
           return;
       }
@@ -743,9 +1074,9 @@ export function renderChat(props: ChatProps) {
     // Cmd+F for search
     if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === "f") {
       e.preventDefault();
-      searchOpen = !searchOpen;
-      if (!searchOpen) {
-        searchQuery = "";
+      vs.searchOpen = !vs.searchOpen;
+      if (!vs.searchOpen) {
+        vs.searchQuery = "";
       }
       requestUpdate();
       return;
@@ -774,9 +1105,6 @@ export function renderChat(props: ChatProps) {
     adjustTextareaHeight(target);
     updateSlashMenu(target.value, requestUpdate);
     inputHistory.reset();
-    // onDraftChange must be last: requestUpdate() inside updateSlashMenu
-    // uses the stale render-time props.draft, overwriting chatMessage.
-    // Calling onDraftChange last ensures the correct DOM value wins.
     props.onDraftChange(target.value);
   };
 
@@ -807,8 +1135,6 @@ export function renderChat(props: ChatProps) {
 
       ${renderSearchBar(requestUpdate)}
       ${renderPinnedSection(props, pinned, requestUpdate)}
-
-      ${renderAgentBar(props)}
 
       <div class="chat-split-container ${sidebarOpen ? "chat-split-container--open" : ""}">
         <div
@@ -877,12 +1203,13 @@ export function renderChat(props: ChatProps) {
 
       ${renderFallbackIndicator(props.fallbackStatus)}
       ${renderCompactionIndicator(props.compactionStatus)}
+      ${renderContextNotice(activeSession, props.sessions?.defaults?.contextTokens ?? null)}
 
       ${
         props.showNewMessages
           ? html`
             <button
-              class="agent-chat__scroll-pill"
+              class="chat-new-messages"
               type="button"
               @click=${props.onScrollToBottom}
             >
@@ -899,11 +1226,13 @@ export function renderChat(props: ChatProps) {
 
         <input
           type="file"
-          accept="image/*,.pdf,.txt,.md,.json,.csv"
+          accept=${CHAT_ATTACHMENT_ACCEPT}
           multiple
           class="agent-chat__file-input"
           @change=${(e: Event) => handleFileSelect(e, props)}
         />
+
+        ${vs.sttRecording && vs.sttInterimText ? html`<div class="agent-chat__stt-interim">${vs.sttInterimText}</div>` : nothing}
 
         <textarea
           ${ref((el) => el && adjustTextareaHeight(el as HTMLTextAreaElement))}
@@ -913,7 +1242,7 @@ export function renderChat(props: ChatProps) {
           @keydown=${handleKeyDown}
           @input=${handleInput}
           @paste=${(e: ClipboardEvent) => handlePaste(e, props)}
-          placeholder=${placeholder}
+          placeholder=${vs.sttRecording ? "Listening..." : placeholder}
           rows="1"
         ></textarea>
 
@@ -931,20 +1260,54 @@ export function renderChat(props: ChatProps) {
             </button>
 
             ${
-              hasVoice
+              isSttSupported()
                 ? html`
                   <button
-                    class="agent-chat__input-btn ${voiceActive ? "agent-chat__input-btn--active" : ""}"
+                    class="agent-chat__input-btn ${vs.sttRecording ? "agent-chat__input-btn--recording" : ""}"
                     @click=${() => {
-                      if (voiceActive) {
-                        stopVoice(requestUpdate);
+                      if (vs.sttRecording) {
+                        stopStt();
+                        vs.sttRecording = false;
+                        vs.sttInterimText = "";
+                        requestUpdate();
                       } else {
-                        startVoice(props, requestUpdate);
+                        const started = startStt({
+                          onTranscript: (text, isFinal) => {
+                            if (isFinal) {
+                              const current = getDraft();
+                              const sep = current && !current.endsWith(" ") ? " " : "";
+                              props.onDraftChange(current + sep + text);
+                              vs.sttInterimText = "";
+                            } else {
+                              vs.sttInterimText = text;
+                            }
+                            requestUpdate();
+                          },
+                          onStart: () => {
+                            vs.sttRecording = true;
+                            requestUpdate();
+                          },
+                          onEnd: () => {
+                            vs.sttRecording = false;
+                            vs.sttInterimText = "";
+                            requestUpdate();
+                          },
+                          onError: () => {
+                            vs.sttRecording = false;
+                            vs.sttInterimText = "";
+                            requestUpdate();
+                          },
+                        });
+                        if (started) {
+                          vs.sttRecording = true;
+                          requestUpdate();
+                        }
                       }
                     }}
-                    title="Voice input"
+                    title=${vs.sttRecording ? "Stop recording" : "Voice input"}
+                    ?disabled=${!props.connected}
                   >
-                    ${voiceActive ? icons.micOff : icons.mic}
+                    ${vs.sttRecording ? icons.micOff : icons.mic}
                   </button>
                 `
                 : nothing
@@ -954,21 +1317,27 @@ export function renderChat(props: ChatProps) {
           </div>
 
           <div class="agent-chat__toolbar-right">
-            <button class="btn-ghost" @click=${() => {
-              searchOpen = !searchOpen;
-              if (!searchOpen) {
-                searchQuery = "";
-              }
-              requestUpdate();
-            }} title="Search (Cmd+F)">
-              ${icons.search}
-            </button>
+            ${nothing /* search hidden for now */}
+            ${
+              canAbort
+                ? nothing
+                : html`
+                    <button
+                      class="btn-ghost"
+                      @click=${props.onNewSession}
+                      title="New session"
+                      aria-label="New session"
+                    >
+                      ${icons.plus}
+                    </button>
+                  `
+            }
             <button class="btn-ghost" @click=${() => exportMarkdown(props)} title="Export" ?disabled=${props.messages.length === 0}>
               ${icons.download}
             </button>
 
             ${
-              canAbort && isBusy
+              canAbort && (isBusy || props.sending)
                 ? html`
                   <button class="chat-send-btn chat-send-btn--stop" @click=${props.onAbort} title="Stop">
                     ${icons.stop}
@@ -997,83 +1366,6 @@ export function renderChat(props: ChatProps) {
   `;
 }
 
-function renderAgentBar(props: ChatProps) {
-  const agents = props.agentsList?.agents ?? [];
-  if (agents.length <= 1 && !props.sessions?.sessions?.length) {
-    return nothing;
-  }
-
-  // Filter sessions for current agent
-  const agentSessions = (props.sessions?.sessions ?? []).filter((s) => {
-    const key = s.key ?? "";
-    return (
-      key.includes(`:${props.currentAgentId}:`) || key.startsWith(`agent:${props.currentAgentId}:`)
-    );
-  });
-
-  return html`
-    <div class="chat-agent-bar">
-      <div class="chat-agent-bar__left">
-        ${
-          agents.length > 1
-            ? html`
-            <select
-              class="chat-agent-select"
-              .value=${props.currentAgentId}
-              @change=${(e: Event) => props.onAgentChange((e.target as HTMLSelectElement).value)}
-            >
-              ${agents.map(
-                (a) => html`
-                <option value=${a.id} ?selected=${a.id === props.currentAgentId}>
-                  ${a.identity?.name || a.name || a.id}
-                </option>
-              `,
-              )}
-            </select>
-          `
-            : html`<span class="chat-agent-bar__name">${agents[0]?.identity?.name || agents[0]?.name || props.currentAgentId}</span>`
-        }
-        ${
-          agentSessions.length > 0
-            ? html`
-            <details class="chat-sessions-panel">
-              <summary class="chat-sessions-summary">
-                ${icons.fileText}
-                <span>Sessions (${agentSessions.length})</span>
-              </summary>
-              <div class="chat-sessions-list">
-                ${agentSessions.map(
-                  (s) => html`
-                  <button
-                    class="chat-session-item ${s.key === props.sessionKey ? "chat-session-item--active" : ""}"
-                    @click=${() => props.onSessionSelect?.(s.key)}
-                  >
-                    <span class="chat-session-item__name">${s.displayName || s.label || s.key}</span>
-                    <span class="chat-session-item__meta muted">${s.model ?? ""}</span>
-                  </button>
-                `,
-                )}
-              </div>
-            </details>
-          `
-            : nothing
-        }
-      </div>
-      <div class="chat-agent-bar__right">
-        ${
-          props.onNavigateToAgent
-            ? html`
-            <button class="btn-ghost btn-ghost--sm" @click=${() => props.onNavigateToAgent?.()} title="Agent settings">
-              ${icons.settings}
-            </button>
-          `
-            : nothing
-        }
-      </div>
-    </div>
-  `;
-}
-
 const CHAT_HISTORY_RENDER_LIMIT = 200;
 
 function groupMessages(items: ChatItem[]): Array<ChatItem | MessageGroup> {
@@ -1092,9 +1384,14 @@ function groupMessages(items: ChatItem[]): Array<ChatItem | MessageGroup> {
 
     const normalized = normalizeMessage(item.message);
     const role = normalizeRoleForGrouping(normalized.role);
+    const senderLabel = role.toLowerCase() === "user" ? (normalized.senderLabel ?? null) : null;
     const timestamp = normalized.timestamp || Date.now();
 
-    if (!currentGroup || currentGroup.role !== role) {
+    if (
+      !currentGroup ||
+      currentGroup.role !== role ||
+      (role.toLowerCase() === "user" && currentGroup.senderLabel !== senderLabel)
+    ) {
       if (currentGroup) {
         result.push(currentGroup);
       }
@@ -1102,6 +1399,7 @@ function groupMessages(items: ChatItem[]): Array<ChatItem | MessageGroup> {
         kind: "group",
         key: `group:${role}:${item.key}`,
         role,
+        senderLabel,
         messages: [{ message: item.message, key: item.key }],
         timestamp,
         isStreaming: false,
@@ -1151,16 +1449,13 @@ function buildChatItems(props: ChatProps): Array<ChatItem | MessageGroup> {
       continue;
     }
 
-    if (!props.showThinking && normalized.role.toLowerCase() === "toolresult") {
+    if (!props.showToolCalls && normalized.role.toLowerCase() === "toolresult") {
       continue;
     }
 
     // Apply search filter if active
-    if (searchOpen && searchQuery.trim()) {
-      const text = typeof normalized.content === "string" ? normalized.content : "";
-      if (!text.toLowerCase().includes(searchQuery.toLowerCase())) {
-        continue;
-      }
+    if (vs.searchOpen && vs.searchQuery.trim() && !messageMatchesSearchQuery(msg, vs.searchQuery)) {
+      continue;
     }
 
     items.push({
@@ -1169,8 +1464,21 @@ function buildChatItems(props: ChatProps): Array<ChatItem | MessageGroup> {
       message: msg,
     });
   }
-  if (props.showThinking) {
-    for (let i = 0; i < tools.length; i++) {
+  // Interleave stream segments and tool cards in order. Each segment
+  // contains text that was streaming before the corresponding tool started.
+  // This ensures correct visual ordering: text → tool → text → tool → ...
+  const segments = props.streamSegments ?? [];
+  const maxLen = Math.max(segments.length, tools.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i < segments.length && segments[i].text.trim().length > 0) {
+      items.push({
+        kind: "stream" as const,
+        key: `stream-seg:${props.sessionKey}:${i}`,
+        text: segments[i].text,
+        startedAt: segments[i].ts,
+      });
+    }
+    if (i < tools.length && props.showToolCalls) {
       items.push({
         kind: "message",
         key: messageKey(tools[i], i + history.length),

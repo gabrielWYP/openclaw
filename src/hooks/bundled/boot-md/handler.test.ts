@@ -10,16 +10,21 @@ const logDebug = vi.fn();
 const MAIN_WORKSPACE_DIR = path.join(path.sep, "ws", "main");
 const OPS_WORKSPACE_DIR = path.join(path.sep, "ws", "ops");
 
+function createMockLogger() {
+  return {
+    warn: logWarn,
+    debug: logDebug,
+    child: vi.fn(() => createMockLogger()),
+  };
+}
+
 vi.mock("../../../gateway/boot.js", () => ({ runBootOnce }));
 vi.mock("../../../agents/agent-scope.js", () => ({
   listAgentIds,
   resolveAgentWorkspaceDir,
 }));
 vi.mock("../../../logging/subsystem.js", () => ({
-  createSubsystemLogger: () => ({
-    warn: logWarn,
-    debug: logDebug,
-  }),
+  createSubsystemLogger: () => createMockLogger(),
 }));
 
 const { default: runBootChecklist } = await import("./handler.js");
@@ -43,6 +48,12 @@ describe("boot-md handler", () => {
     resolveAgentWorkspaceDir.mockImplementation((_cfg: unknown, id: string) =>
       id === "main" ? MAIN_WORKSPACE_DIR : OPS_WORKSPACE_DIR,
     );
+    return cfg;
+  }
+
+  function setupSingleMainAgentBootConfig(cfg: unknown) {
+    listAgentIds.mockReturnValue(["main"]);
+    resolveAgentWorkspaceDir.mockReturnValue(MAIN_WORKSPACE_DIR);
     return cfg;
   }
 
@@ -82,9 +93,7 @@ describe("boot-md handler", () => {
   });
 
   it("runs boot for single default agent when no agents configured", async () => {
-    const cfg = {};
-    listAgentIds.mockReturnValue(["main"]);
-    resolveAgentWorkspaceDir.mockReturnValue(MAIN_WORKSPACE_DIR);
+    const cfg = setupSingleMainAgentBootConfig({});
     runBootOnce.mockResolvedValue({ status: "skipped", reason: "missing" });
 
     await runBootChecklist(makeEvent({ context: { cfg } }));
@@ -112,9 +121,7 @@ describe("boot-md handler", () => {
   });
 
   it("logs debug details when a per-agent boot run is skipped", async () => {
-    const cfg = { agents: { list: [{ id: "main" }] } };
-    listAgentIds.mockReturnValue(["main"]);
-    resolveAgentWorkspaceDir.mockReturnValue(MAIN_WORKSPACE_DIR);
+    const cfg = setupSingleMainAgentBootConfig({ agents: { list: [{ id: "main" }] } });
     runBootOnce.mockResolvedValue({ status: "skipped", reason: "missing" });
 
     await runBootChecklist(makeEvent({ context: { cfg } }));

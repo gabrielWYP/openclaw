@@ -12,6 +12,8 @@ import {
 } from "./app-settings.ts";
 import { handleAgentEvent, resetToolStream, type AgentEventPayload } from "./app-tool-stream.ts";
 import type { OpenClawApp } from "./app.ts";
+import { shouldReloadHistoryForFinalEvent } from "./chat-event-reload.ts";
+import { formatConnectError } from "./connect-error.ts";
 import { loadAgents } from "./controllers/agents.ts";
 import { loadAssistantIdentity } from "./controllers/assistant-identity.ts";
 import { loadChatHistory } from "./controllers/chat.ts";
@@ -26,8 +28,12 @@ import {
 } from "./controllers/exec-approval.ts";
 import { loadHealthState } from "./controllers/health.ts";
 import { loadNodes } from "./controllers/nodes.ts";
-import { loadSessions } from "./controllers/sessions.ts";
-import type { GatewayEventFrame, GatewayHelloOk } from "./gateway.ts";
+import { loadSessions, subscribeSessions } from "./controllers/sessions.ts";
+import {
+  resolveGatewayErrorDetailCode,
+  type GatewayEventFrame,
+  type GatewayHelloOk,
+} from "./gateway.ts";
 import { GatewayBrowserClient } from "./gateway.ts";
 import type { Tab } from "./navigation.ts";
 import type { UiSettings } from "./storage.ts";
@@ -39,13 +45,19 @@ import type {
   UpdateAvailable,
 } from "./types.ts";
 
+function isGenericBrowserFetchFailure(message: string): boolean {
+  return /^(?:typeerror:\s*)?(?:fetch failed|failed to fetch)$/i.test(message.trim());
+}
+
 type GatewayHost = {
   settings: UiSettings;
   password: string;
+  clientInstanceId: string;
   client: GatewayBrowserClient | null;
   connected: boolean;
   hello: GatewayHelloOk | null;
   lastError: string | null;
+  lastErrorCode: string | null;
   onboarding?: boolean;
   eventLogBuffer: EventLogEntry[];
   eventLog: EventLogEntry[];
@@ -63,6 +75,7 @@ type GatewayHost = {
   assistantName: string;
   assistantAvatar: string | null;
   assistantAgentId: string | null;
+  serverVersion: string | null;
   sessionKey: string;
   chatRunId: string | null;
   refreshSessionsAfterChat: Set<string>;
@@ -77,6 +90,37 @@ type SessionDefaultsSnapshot = {
   mainSessionKey?: string;
   scope?: string;
 };
+
+type GatewayHostWithShutdownMessage = GatewayHost & {
+  pendingShutdownMessage?: string | null;
+};
+
+export function resolveControlUiClientVersion(params: {
+  gatewayUrl: string;
+  serverVersion: string | null;
+  pageUrl?: string;
+}): string | undefined {
+  const serverVersion = params.serverVersion?.trim();
+  if (!serverVersion) {
+    return undefined;
+  }
+  const pageUrl =
+    params.pageUrl ?? (typeof window === "undefined" ? undefined : window.location.href);
+  if (!pageUrl) {
+    return undefined;
+  }
+  try {
+    const page = new URL(pageUrl);
+    const gateway = new URL(params.gatewayUrl, page);
+    const allowedProtocols = new Set(["ws:", "wss:", "http:", "https:"]);
+    if (!allowedProtocols.has(gateway.protocol) || gateway.host !== page.host) {
+      return undefined;
+    }
+    return serverVersion;
+  } catch {
+    return undefined;
+  }
+}
 
 function normalizeSessionKeyForDefaults(
   value: string | undefined,
@@ -131,25 +175,36 @@ function applySessionDefaults(host: GatewayHost, defaults?: SessionDefaultsSnaps
 }
 
 export function connectGateway(host: GatewayHost) {
+  const shutdownHost = host as GatewayHostWithShutdownMessage;
+  shutdownHost.pendingShutdownMessage = null;
   host.lastError = null;
+  host.lastErrorCode = null;
   host.hello = null;
   host.connected = false;
   host.execApprovalQueue = [];
   host.execApprovalError = null;
 
   const previousClient = host.client;
+  const clientVersion = resolveControlUiClientVersion({
+    gatewayUrl: host.settings.gatewayUrl,
+    serverVersion: host.serverVersion,
+  });
   const client = new GatewayBrowserClient({
     url: host.settings.gatewayUrl,
     token: host.settings.token.trim() ? host.settings.token : undefined,
     password: host.password.trim() ? host.password : undefined,
     clientName: "openclaw-control-ui",
+    clientVersion,
     mode: "webchat",
+    instanceId: host.clientInstanceId,
     onHello: (hello) => {
       if (host.client !== client) {
         return;
       }
+      shutdownHost.pendingShutdownMessage = null;
       host.connected = true;
       host.lastError = null;
+      host.lastErrorCode = null;
       host.hello = hello;
       applySnapshot(host, hello);
       // Reset orphaned chat run state from before disconnect.
@@ -158,6 +213,7 @@ export function connectGateway(host: GatewayHost) {
       (host as unknown as { chatStream: string | null }).chatStream = null;
       (host as unknown as { chatStreamStartedAt: number | null }).chatStreamStartedAt = null;
       resetToolStream(host as unknown as Parameters<typeof resetToolStream>[0]);
+      void subscribeSessions(host as unknown as OpenClawApp);
       void loadAssistantIdentity(host as unknown as OpenClawApp);
       void loadAgents(host as unknown as OpenClawApp);
       void loadHealthState(host as unknown as OpenClawApp);
@@ -165,19 +221,32 @@ export function connectGateway(host: GatewayHost) {
       void loadDevices(host as unknown as OpenClawApp, { quiet: true });
       void refreshActiveTab(host as unknown as Parameters<typeof refreshActiveTab>[0]);
     },
-    onClose: ({ code, reason }) => {
+    onClose: ({ code, reason, error }) => {
       if (host.client !== client) {
         return;
       }
       host.connected = false;
-      // Code 1008 = Policy Violation (auth failure) — show the gateway's reason directly
-      if (code === 1008) {
-        host.lastError = reason || "Authentication failed. Check your gateway token.";
-        return;
-      }
       // Code 1012 = Service Restart (expected during config saves, don't show as error)
+      host.lastErrorCode =
+        resolveGatewayErrorDetailCode(error) ??
+        (typeof error?.code === "string" ? error.code : null);
       if (code !== 1012) {
-        host.lastError = `disconnected (${code}): ${reason || "no reason"}`;
+        if (error?.message) {
+          host.lastError =
+            host.lastErrorCode && isGenericBrowserFetchFailure(error.message)
+              ? formatConnectError({
+                  message: error.message,
+                  details: error.details,
+                  code: error.code,
+                } as Parameters<typeof formatConnectError>[0])
+              : error.message;
+          return;
+        }
+        host.lastError =
+          shutdownHost.pendingShutdownMessage ?? `disconnected (${code}): ${reason || "no reason"}`;
+      } else {
+        host.lastError = shutdownHost.pendingShutdownMessage ?? null;
+        host.lastErrorCode = null;
       }
     },
     onEvent: (evt) => {
@@ -191,6 +260,7 @@ export function connectGateway(host: GatewayHost) {
         return;
       }
       host.lastError = `event gap detected (expected seq ${expected}, got ${received}); refresh recommended`;
+      host.lastErrorCode = null;
     },
   });
   host.client = client;
@@ -203,6 +273,51 @@ export function handleGatewayEvent(host: GatewayHost, evt: GatewayEventFrame) {
     handleGatewayEventUnsafe(host, evt);
   } catch (err) {
     console.error("[gateway] handleGatewayEvent error:", evt.event, err);
+  }
+}
+
+function handleTerminalChatEvent(
+  host: GatewayHost,
+  payload: ChatEventPayload | undefined,
+  state: ReturnType<typeof handleChatEvent>,
+): boolean {
+  if (state !== "final" && state !== "error" && state !== "aborted") {
+    return false;
+  }
+  // Check if tool events were seen before resetting (resetToolStream clears toolStreamOrder).
+  const toolHost = host as unknown as Parameters<typeof resetToolStream>[0];
+  const hadToolEvents = toolHost.toolStreamOrder.length > 0;
+  resetToolStream(toolHost);
+  void flushChatQueueForEvent(host as unknown as Parameters<typeof flushChatQueueForEvent>[0]);
+  const runId = payload?.runId;
+  if (runId && host.refreshSessionsAfterChat.has(runId)) {
+    host.refreshSessionsAfterChat.delete(runId);
+    if (state === "final") {
+      void loadSessions(host as unknown as OpenClawApp, {
+        activeMinutes: CHAT_SESSIONS_ACTIVE_MINUTES,
+      });
+    }
+  }
+  // Reload history when tools were used so the persisted tool results
+  // replace the now-cleared streaming state.
+  if (hadToolEvents && state === "final") {
+    void loadChatHistory(host as unknown as OpenClawApp);
+    return true;
+  }
+  return false;
+}
+
+function handleChatGatewayEvent(host: GatewayHost, payload: ChatEventPayload | undefined) {
+  if (payload?.sessionKey) {
+    setLastActiveSessionKey(
+      host as unknown as Parameters<typeof setLastActiveSessionKey>[0],
+      payload.sessionKey,
+    );
+  }
+  const state = handleChatEvent(host as unknown as OpenClawApp, payload);
+  const historyReloaded = handleTerminalChatEvent(host, payload, state);
+  if (state === "final" && !historyReloaded && shouldReloadHistoryForFinalEvent(payload)) {
+    void loadChatHistory(host as unknown as OpenClawApp);
   }
 }
 
@@ -227,30 +342,7 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
   }
 
   if (evt.event === "chat") {
-    const payload = evt.payload as ChatEventPayload | undefined;
-    if (payload?.sessionKey) {
-      setLastActiveSessionKey(
-        host as unknown as Parameters<typeof setLastActiveSessionKey>[0],
-        payload.sessionKey,
-      );
-    }
-    const state = handleChatEvent(host as unknown as OpenClawApp, payload);
-    if (state === "final" || state === "error" || state === "aborted") {
-      resetToolStream(host as unknown as Parameters<typeof resetToolStream>[0]);
-      void flushChatQueueForEvent(host as unknown as Parameters<typeof flushChatQueueForEvent>[0]);
-      const runId = payload?.runId;
-      if (runId && host.refreshSessionsAfterChat.has(runId)) {
-        host.refreshSessionsAfterChat.delete(runId);
-        if (state === "final") {
-          void loadSessions(host as unknown as OpenClawApp, {
-            activeMinutes: CHAT_SESSIONS_ACTIVE_MINUTES,
-          });
-        }
-      }
-    }
-    if (state === "final") {
-      void loadChatHistory(host as unknown as OpenClawApp);
-    }
+    handleChatGatewayEvent(host, evt.payload as ChatEventPayload | undefined);
     return;
   }
 
@@ -261,6 +353,27 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
       host.presenceError = null;
       host.presenceStatus = null;
     }
+    return;
+  }
+
+  if (evt.event === "shutdown") {
+    const payload = evt.payload as { reason?: unknown; restartExpectedMs?: unknown } | undefined;
+    const reason =
+      payload && typeof payload.reason === "string" && payload.reason.trim()
+        ? payload.reason.trim()
+        : "gateway stopping";
+    const shutdownMessage =
+      typeof payload?.restartExpectedMs === "number"
+        ? `Restarting: ${reason}`
+        : `Disconnected: ${reason}`;
+    (host as GatewayHostWithShutdownMessage).pendingShutdownMessage = shutdownMessage;
+    host.lastError = shutdownMessage;
+    host.lastErrorCode = null;
+    return;
+  }
+
+  if (evt.event === "sessions.changed") {
+    void loadSessions(host as unknown as OpenClawApp);
     return;
   }
 
