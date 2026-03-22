@@ -245,8 +245,11 @@ upsert_env "$ENV_FILE" \
   OPENCLAW_DOCKER_APT_PACKAGES
 
 echo "==> Building Docker image: $IMAGE_NAME"
+# Detect host's docker GID for socket access
+DOCKER_GID=$(getent group docker | cut -d: -f3 || echo "999")
 docker build \
   --build-arg "OPENCLAW_DOCKER_APT_PACKAGES=${OPENCLAW_DOCKER_APT_PACKAGES}" \
+  --build-arg "DOCKER_GID=${DOCKER_GID}" \
   -t "$IMAGE_NAME" \
   -f "$ROOT_DIR/Dockerfile" \
   "$ROOT_DIR"
